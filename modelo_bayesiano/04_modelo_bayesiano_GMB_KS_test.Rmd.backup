@@ -1,0 +1,3731 @@
+---
+title: An R Markdown document converted from "/projects/ADE_biomass_harmonization/biomass_harmonization/NASA_CMS_2023/Mexico/GMB_Mexico.ipynb"
+output: html_document
+---
+
+
+---
+
+**Objetivo General:**
+Este script tiene como objetivo principal desarrollar un modelo geoestadístico bayesiano (Geostatistical Model-Based, GMB) para estimar la Densidad de Biomasa Aérea (AGBD) en Quintana Roo, México. Para ello, integra datos de campo del Inventario Nacional Forestal (NFI) con productos de teledetección, específicamente el mapa de biomasa de la ESA (CCI) y el mapa de altura del dosel de GEDI.
+
+**Objetivos Particulares:**
+1.  **Cargar y Preprocesar Datos:** Cargar y alinear los datos del NFI, el ráster de biomasa CCI y el ráster de altura GEDI.
+2.  **Construir el Modelo:** Crear un modelo espacial jerárquico utilizando el paquete `INLA` en R para predecir la biomasa del NFI en función de las covariables de teledetección (CCI y GEDI).
+3.  **Validar el Modelo:** Evaluar el rendimiento del modelo final comparando sus predicciones con un subconjunto de datos del NFI que no se utilizó durante el entrenamiento.
+
+
+```{r}
+#Bibliotecas
+
+library("fmesher")
+library(MatrixModels)
+library(Matrix)
+library(INLA)
+library(inlabru)
+library("jpeg")
+library(sf)
+library(terra)
+library(dplyr)
+library(spdep)
+library(raster)
+library(exactextractr)
+library(ggplot2)
+library(viridis)
+library(sn)
+library(geodata)
+library(tidyterra)
+library(tidyr)
+library(gridExtra)
+```
+
+This notebook shows how to integrate Mexican NFI-estimated AGBD (3rd cycle), ESA CCI Biomass AGBD (see https://climate.esa.int/en/projects/biomass/) and GEDI Forest Height estimates (see https://glad.umd.edu/dataset/gedi). 
+
+It is based on the FAIR (findable, accessible, interoperable, and replicable) Data Principles (Wilkinson et al., 2016), and relies on the computational power of the INLA Package in R (https://www.r-inla.org/).  
+
+Practical applications are demonstrated at the end of this notebook. They include using our models for gap-filling Mexico's NFI, and estimation of mean AGBD (with associated uncertainty) in their forest/administrative strata. 
+
+We have also created two psuedo areas where diturbance will occur in the future. At the end of this notebook, we will predict AGBD in these areas before disturbance using all of the above data!
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+################################# Model-assisted vs model-based #################################
+
+The approach presented in this notebook is a Geostatistical Model-Based (GMB) approach. 
+
+As noted from McRoberts et at (2022): With model-based inference each population unit is assumed to have an entire distribution of possible values as opposed to design-based inference, for which each population unit is assumed to have one and only one possible value. Standard model-based terminology specifies use of the verb “to predict” when referring to random variables and “to estimate” when referring to fixed value parameters. Model-based inferences do not require probability samples, although they can be used, and in many instances may be preferable.
+
+Bayesian inference is used in our approach, whereby we approximate the distribution of our model parameters and predict AGBD at any given location. 
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+################################# Geostatistical Model-based Estimation #########################
+
+Our target variable (AGBD) at any given location (s) is assumed to follow the following linear model
+
+\begin{align}
+y(s) = \alpha + \beta.x(s) + \epsilon(s)
+\end{align}
+
+Where y(s) is the estimated AGBD at location s, and x(s) is a covariate (e.g. CCI Biomass map). Further, $\epsilon(s)$ is the random error. This should be straightforward to solve. However, the errors of $\alpha$ and $\beta$ could be spatially varying across the extent of Mexico, and hence may not be "fixed". To deal with this, we add a spatially-varying term to $\alpha$ and $\beta$ that will capture this variance.  
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x(s) + \epsilon(s)
+\end{align}
+
+Further, if you wanted to add another covariate (e.g. the CCI as well as a map of GEDI height estimates) to predict AGBD, the model will look like
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x1(s) + (\eta + \tilde{\eta}(s)).x2(s) + \epsilon(s) 
+\end{align}
+
+Most of the values should be familiar. $\alpha$, $\beta$ and $\eta$ are constant regression parameters. x1 and x2 are our covariates (here, the CCI map and the GEDI height map). $\alpha$, $\beta$ and $\eta$ have associated errors $\tilde{\alpha}$, $\tilde{\beta}$ and $\tilde{\eta}$ that are spatially autocorrelated. These errors capture the spatially-varying component of $\alpha$, $\beta$ and $\eta$. If you solve this equation at every location s, you will have accounted for the spatial dependence among residuals of the model. In a Bayesian hierarchical framework, it is possible to estimate the spatial covariance parameters and, hence, propagate their uncertainties through to the prediction of the outcome variable (Babcock et al. 2015). 
+
+A caveat, however, is that solving the above model is natively is computationally expensive when the number of observations becomes large. We can circumvent this by splitting Mexico up into (very) small regions. This is done by the use of a mesh, and approximating the model outputs for each node/vertex of the mesh. So, we first define an underlying "mesh", which draws a graph of triangles across the study area. On the vertices of triangles, we define a neighbor-based spatial model where two vertices are neighbors if there is a triangle edge connecting them. To extend this to continuous locations, the value of $\tilde{\alpha}$, $\tilde{\beta}$ and $\tilde{\eta}$ at any location (s) lying within a triangle is linearly interpolated from the 3 vertices of the containing triangle. The reason why this is more computationally effecient is that the process on the vertices is sparse, i.e. for any given vertex, it only needs the information from the connected vertices. This will become clearer as we go through the code. 
+
+
+```{r}
+### Objetivo Particular: 1. Cargar y Preprocesar Datos
+
+######################## LOAD THE OUTLINE OF MEXICO AND ADMIN BOUNDARIES #############
+options(repr.plot.width=10, repr.plot.height=10)
+
+# Carga el límite y lo proyecta a 32616
+mexico = st_read("../insumos/QuintanaRoo_Entidad_MOD.gpkg", quiet = TRUE) %>% st_union() %>% st_transform(crs = 32616) 
+
+```
+
+
+
+
+
+```{r}
+# ########################## READ THE MEXICAN NFI DATA ###################################
+
+
+plot_WGS84 <- st_read("../insumos/INF_WGS84.gpkg", 
+                       quiet = TRUE)
+
+# ========================== CONVERSIÓN DE UNIDADES ==========================
+# Suma biomasa por individuo a nivel CONGLOMERADO y convierte kg → Mg/ha
+# Estructura INFyS: 1 conglomerado = 4 sitios × 400 m² = 0.16 ha de área efectiva
+# Referencia: CONAFOR (2019) - Procedimientos de Muestreo INFyS
+
+cat("Número de árboles individuales antes de agrupar:", nrow(plot_WGS84), "\n")
+
+# Extraer coordenadas antes de agrupar (una por conglomerado)
+coords_conglomerados <- plot_WGS84 %>%
+  group_by(IdConglomerado) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    lon = st_coordinates(.)[,1],
+    lat = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry() %>%
+  dplyr::select(IdConglomerado, lon, lat)
+
+# Agrupar y calcular biomasa (sin geometría)
+plot_WGS84 <- plot_WGS84 %>%
+  st_drop_geometry() %>%                 
+  group_by(IdConglomerado) %>%
+  summarise(
+    biomasa_kg_total = sum(biomasa_kg_C3, na.rm = TRUE),    
+    biomasa_Mg_ha = biomasa_kg_total / 1000 / 0.16,         
+    .groups = 'drop'
+  ) %>%
+  filter(
+    !is.na(biomasa_Mg_ha),
+    biomasa_Mg_ha > 0
+  ) %>%
+  left_join(coords_conglomerados, by = "IdConglomerado") %>%  
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)             
+
+cat("Número de conglomerados después de agrupar:", nrow(plot_WGS84), "\n")
+cat("Rango de biomasa [Mg/ha]:", range(plot_WGS84$biomasa_Mg_ha, na.rm = TRUE), "\n")
+
+
+# Filtrar conglomerados que están dentro del límite de Quintana Roo
+
+cat("\n--- Aplicando filtrado por máscara de Quintana Roo ---\n")
+
+# Guardar número de conglomerados antes del filtrado
+n_antes <- nrow(plot_WGS84)
+cat("Conglomerados antes del filtrado espacial:", n_antes, "\n")
+
+# mismo CRS
+mexico_mask <- st_read("../insumos/QuintanaRoo_Entidad_MOD.gpkg", quiet = TRUE)
+plot_WGS84 <- st_transform(plot_WGS84, st_crs(mexico_mask))
+
+# Filtrar puntos dentro de la máscara
+plot_WGS84 <- plot_WGS84[mexico_mask, ]
+
+# Reporte del filtrado
+n_despues <- nrow(plot_WGS84)
+cat("Conglomerados después del filtrado espacial:", n_despues, "\n")
+cat("Conglomerados removidos:", n_antes - n_despues, "\n\n")
+
+#  TRAIN / TEST SPLIT 
+
+set.seed(123)  # Para reproducibilidad
+dt <- sort(sample(nrow(plot_WGS84), nrow(plot_WGS84) * .9))
+plot_WGS84_T <- plot_WGS84[-dt, ]  # 10% prueba (extraer ANTES de sobrescribir)
+plot_WGS84   <- plot_WGS84[dt, ]   # 90% entrenamiento
+
+# COORDENADAS Y PROYECCIÓN
+
+loc.plot.WGS84 <- st_coordinates(plot_WGS84)           
+plot <- plot_WGS84 %>% st_transform("epsg:32616")       
+loc.plot <- st_coordinates(plot)                        
+
+# VARIABLE RESPUESTA
+#
+agbd.plot <- plot$biomasa_Mg_ha  # ahora en Mg/ha (convertido desde kg)
+#
+# Verifica:
+print(length(agbd.plot))
+print(summary(agbd.plot))         
+
+```
+
+```{r}
+# Cargar la máscara de Quintana Roo
+qroo_mask <- st_read("../insumos/QuintanaRoo_Entidad_MOD.gpkg", quiet = TRUE)
+
+# mismo CRS
+plot_WGS84_mapa <- st_transform(plot_WGS84, st_crs(qroo_mask))
+
+# Filtrar parcelas dentro de la máscara de Quintana Roo
+parcelas_qroo <- st_filter(plot_WGS84_mapa, qroo_mask)
+
+# Mapa
+ggplot() +
+  # Fondo: límite de Quintana Roo (máscara)
+  geom_sf(data = qroo_mask, fill = "grey95", color = "grey50", linewidth = 0.5) +
+
+  # Puntos de parcelas
+  geom_sf(data = parcelas_qroo,
+          aes(color = biomasa_Mg_ha),
+          size = 2.5, alpha = 0.85) +
+
+  # Paleta 
+  scale_color_gradientn(
+    colors = c("#FFFFCC", "#A1D99B", "#41AB5D", "#006D2C", "#00441B"),
+    name   = "Biomasa\n(Mg/ha)",
+    guide = guide_colorbar(barwidth = 1, barheight = 10)
+  ) +
+
+  labs(
+    title    = "Biomasa Aérea por Parcela del INFyS",
+    subtitle = "Quintana Roo — Límite estatal",
+    caption  = "Fuente: INFyS - CONAFOR",
+    x = "Longitud", y = "Latitud"
+  ) +
+
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    plot.caption = element_text(size = 9, color = "grey50"),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+
+# MAPA DE ALTURA DE VEGETACIÓN (GEDI) - QUINTANA ROO
+
+
+# Cargar el raster de altura
+hei.rast <- rast("../productos/hei.tif")
+
+
+# MAPA - Altura de 0 a 30 metros
+
+
+ggplot() +
+  geom_spatraster(data = hei.rast) +
+  # Agregar borde administrativo de Quintana Roo
+  geom_sf(data = qroo_mask, fill = NA, color = "black", linewidth = 0.8) +
+  scale_fill_gradientn(
+    colors = c("#000000", "#8B4513", "#D2B48C", "#9ACD32", "#228B22", "#006400"),
+    name = "Altura\n(m)",
+    na.value = "transparent",
+    limits = c(0, 30),
+    oob = scales::squish,
+    guide = guide_colorbar(barwidth = 1, barheight = 10)
+  ) +
+  labs(
+    title = "Altura de Vegetación (GEDI-NASA) en Quintana Roo",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.position = "right",
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+summary(hei.rast)
+```
+
+
+```{r}
+
+
+# Cargar el raster
+cci.rast <- rast("../productos/biomasa.tif")
+
+# Extraer los valores como vector
+valores <- values(cci.rast, na.rm = TRUE)
+
+# Convertir a dataframe para ggplot
+df <- data.frame(AGBD = as.numeric(valores))
+
+# Histograma
+ggplot(df, aes(x = AGBD)) +
+  geom_histogram(bins = 50, fill = "#e67e22", color = "white", alpha = 0.85) +
+  labs(
+    title = "Distribución de Biomasa Aérea (CCI-ESA)",
+    subtitle = "Quintana Roo",
+    x = "AGBD (Mg/ha)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+        panel.grid.minor = element_blank())
+
+# Densidad (alternativa más suave)
+ggplot(df, aes(x = AGBD)) +
+  geom_density(fill = "#d68910", color = "#935116", alpha = 0.7, linewidth = 1) +
+  labs(
+    title = "Distribución de Biomasa Aérea (CCI-ESA)",
+    subtitle = "Quintana Roo",
+    x = "AGBD (Mg/ha)",
+    y = "Densidad"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+        panel.grid.minor = element_blank())
+
+# Estadísticas básicas
+summary(valores)
+```
+
+```{r}
+
+ggplot() +
+  geom_spatraster(data = cci.rast) +
+  # Agregar borde administrativo de Quintana Roo
+  geom_sf(data = qroo_mask, fill = NA, color = "black", linewidth = 0.8) +
+  scale_fill_gradientn(
+    colors = c("#000000", "#ffffcc", "#78c679", "#238443", "#004529"),
+    name = "AGBD\n(Mg/ha)",
+    na.value = "transparent",
+    guide = guide_colorbar(barwidth = 1, barheight = 10)
+  ) +
+  labs(
+    title = "Biomasa Aérea (CCI-ESA) en Quintana Roo",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.position = "right",
+        panel.grid.minor = element_blank())
+
+
+```
+
+
+
+```{r}
+
+
+# promedio de todos los insumos por parcelas
+cci.plot = exactextractr::exact_extract(cci.rast, st_buffer(plot,56.42), 'mean')
+hei.plot = exactextractr::exact_extract(  hei.rast,   st_buffer(plot, 56.42),   'mean')
+ggplot() +
+  coord_sf(crs = 32616) +
+  geom_point(aes(x = loc.plot[,1], y = loc.plot[,2], col = cci.plot), size = 2.5, alpha = 0.7) +
+  scale_color_viridis(option = "plasma", name = "AGBD\n(Mg/ha)") +
+  labs(title = "Biomasa Aérea CCI-ESA en Parcelas INFyS",
+       x = "Este (m)", y = "Norte (m)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+        legend.position = "right")
+
+ggplot() +
+  coord_sf(crs = 32616) +
+  geom_point(aes(x = loc.plot[,1], y = loc.plot[,2], col = hei.plot), size = 2.5, alpha = 0.7) +
+  scale_color_viridis(option = "viridis", name = "Altura\n(m)") +
+  labs(title = "Altura de Vegetación GEDI en Parcelas INFyS",
+       x = "Este (m)", y = "Norte (m)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+        legend.position = "right")
+
+
+DATA_FULL <- data.frame(
+  IdConglomerado = plot$IdConglomerado,  # ID del conglomerado INFyS
+  X_coord = loc.plot[,1],
+  Y_coord = loc.plot[,2],
+  cci.plot = cci.plot,  # Columna para la Biomasa CCI
+  hei.plot = hei.plot,  # Columna para la Altura GEDI
+  agbd.plot = agbd.plot # Columna para la Biomasa NFI
+
+) 
+
+
+
+# GUARDAR PRODUCTOS DERIVADOS EN GMB_MODIFICADO
+
+output_dir <- "../productos"
+write.csv(DATA_FULL, file.path(output_dir, "NFI_CCI_GEDIheights_2.csv"), row.names=FALSE)
+
+
+
+
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# ANÁLISIS DE CORRELACIÓN: NFI (2 transformaciones) vs CCI y GLAD
+# 
+
+# ── 1. Transformaciones de la respuesta 
+DATA$agbd.plot_log  <- log1p(DATA$agbd.plot)   # log(1 + x)
+DATA$agbd.plot_sqrt <- sqrt(DATA$agbd.plot)    # raíz cuadrada
+
+# ── 2. Correlaciones (Pearson) 
+R <- list(
+  none_cci   = cor(DATA$agbd.plot,      DATA$cci.plot, use = "complete.obs"),
+  sqrt_cci   = cor(DATA$agbd.plot_sqrt, DATA$cci.plot, use = "complete.obs"),
+  log_cci    = cor(DATA$agbd.plot_log,  DATA$cci.plot, use = "complete.obs"),
+  none_glad  = cor(DATA$agbd.plot,      DATA$hei.plot, use = "complete.obs"),
+  sqrt_glad  = cor(DATA$agbd.plot_sqrt, DATA$hei.plot, use = "complete.obs"),
+  log_glad   = cor(DATA$agbd.plot_log,  DATA$hei.plot, use = "complete.obs")
+)
+
+
+tema_comun <- theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(size = 13, face = "bold", hjust = 0.5),
+        panel.grid.minor = element_blank(),
+        legend.position  = "right")
+
+
+panel <- function(xvar, yvar, xlab, ylab, titulo, r_val, limits = NULL) {
+  ggplot(DATA, aes(x = .data[[xvar]], y = .data[[yvar]])) +
+    geom_bin2d(bins = 100) +
+    scale_fill_viridis_c(option = "magma", name = "Conteo",
+                         direction = 1, limits = limits) +
+    xlab(xlab) + ylab(ylab) + ggtitle(titulo) +
+    annotate("label",
+             x = max(DATA[[xvar]], na.rm = TRUE) * 0.95,
+             y = max(DATA[[yvar]], na.rm = TRUE) * 0.95,
+             label = sprintf("R = %.3f", r_val),
+             hjust = 1, vjust = 1, size = 4,
+             color = "black", fill = "white", alpha = 0.8, fontface = "bold") +
+    tema_comun
+}
+
+# Configuración de los 6 paneles
+cfg <- list(
+  cci_none  = list("agbd.plot",      "cci.plot", "AGBD [Mg/ha]",   "CCI AGBD [Mg/ha]", "CCI ~ AGBD",         R$none_cci),
+  cci_sqrt  = list("agbd.plot_sqrt", "cci.plot", "sqrt(AGBD)",     "CCI AGBD [Mg/ha]", "CCI ~ sqrt(AGBD)",   R$sqrt_cci),
+  cci_log   = list("agbd.plot_log",  "cci.plot", "log(1 + AGBD)",  "CCI AGBD [Mg/ha]", "CCI ~ log(1+AGBD)",  R$log_cci),
+  glad_none = list("agbd.plot",      "hei.plot", "AGBD [Mg/ha]",   "GLAD altura [m]",  "GLAD ~ AGBD",        R$none_glad),
+  glad_sqrt = list("agbd.plot_sqrt", "hei.plot", "sqrt(AGBD)",     "GLAD altura [m]",  "GLAD ~ sqrt(AGBD)",  R$sqrt_glad),
+  glad_log  = list("agbd.plot_log",  "hei.plot", "log(1 + AGBD)",  "GLAD altura [m]",  "GLAD ~ log(1+AGBD)", R$log_glad)
+)
+
+# medir el conteo máximo global
+plots_tmp <- lapply(cfg, function(p)
+  panel(p[[1]], p[[2]], p[[3]], p[[4]], p[[5]], p[[6]], limits = NULL))
+
+gmax <- max(sapply(plots_tmp, function(p)
+  max(ggplot_build(p)$data[[1]]$count, na.rm = TRUE)))
+
+# reconstruir con la MISMA escala de color
+plots <- lapply(cfg, function(p)
+  panel(p[[1]], p[[2]], p[[3]], p[[4]], p[[5]], p[[6]], limits = c(1, gmax)))
+
+# Cada gráfica queda accesible por nombre:
+p_cci_none  <- plots$cci_none
+p_cci_sqrt  <- plots$cci_sqrt
+p_cci_log   <- plots$cci_log
+p_glad_none <- plots$glad_none
+p_glad_sqrt <- plots$glad_sqrt
+p_glad_log  <- plots$glad_log
+
+
+
+# Mostrar cada gráfica en R
+print(p_cci_none)
+print(p_cci_sqrt)
+print(p_cci_log)
+print(p_glad_none)
+print(p_glad_sqrt)
+print(p_glad_log)
+```
+
+### Objetivo Particular: 2. Construir el Modelo (Introducción)
+
+## BUILDING THE GEOSPATIAL MODEL WE DEFINED FOR MEXICO ###########
+
+Since we are now familiar with INLA, let's try to solve our model: 
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x1(s) + (\eta + \tilde{\eta}(s)).x2(s) + \epsilon(s)
+\end{align}
+
+Solving this model is computationally expensive. Instead, an approximation of the solutions can be constructed, typically based upon discretizations of space, i.e. breaking Mexico up by a mesh. The solutions then, in turn, are an approximation of the true solution. This method of discretization is called a finite element method (FEM), very commonly used in physics and engineering.
+
+The steps followed below are first explained in words: 
+
+(1) We start with building a mesh over Mexico. These are our finite elements. 
+
+(2) We then define a spatial model for each spatially-varying parameter ($\tilde{\alpha}(s)$, $\tilde{\beta}(s)$ and $\tilde{\eta}(s)$), and we ask INLA to solve it!
+
+Once INLA has done its job, we can check our model residuals and make predictions at our hold-out 10% of NFI plot locations. 
+
+Also, we can get values of $(\alpha + \tilde{\alpha}(s))$, $(\beta + \tilde{\beta}(s))$ and $(\eta + \tilde{\eta}(s))$ for any location we want! 
+
+Since we will have the model's fixed parameters and their spatially-varying components, we can get predicted AGBD at any location we want. 
+This means, we can find a patch of newly deforested land, and predict what baseline AGBD would have been there (for example). 
+We can also predict AGBD and compare it to CONAFOR's 1 km gridded map. 
+
+
+```{r}
+################### MAKING A MESH SURFACE OVER MEXICO ###################
+
+options(repr.plot.width = 10, repr.plot.height = 10)
+
+# PREPARACIÓN Y LIMPIEZA
+mexico_proj <- st_make_valid(mexico) %>% st_transform(crs = 32616)
+
+data_for_plot <- data.frame(
+  X    = loc.plot[, 1],
+  Y    = loc.plot[, 2],
+  agbd = agbd.plot
+)
+data_for_plot <- na.omit(data_for_plot)
+
+# CREACIÓN DE LA MALLA SPDE 
+max.edge     <- 15 * 10^3  # 15 km
+mexico.buffer <- st_buffer(mexico_proj, dist = max.edge * 5)  # Buffer 75 km
+
+mesh <- inla.mesh.2d(
+  boundary = list(
+    as(mexico_proj,  "Spatial"),
+    as(mexico.buffer, "Spatial")
+  ),
+  max.edge = c(max.edge, 3 * max.edge),
+  cutoff   = 2 * max.edge / 3,
+  offset   = c(max.edge, 5 * max.edge)
+)
+
+#  RECORTE DE TRIÁNGULOS POR CENTROIDES 
+# Extraer la matriz de triángulos (índices de vértices)
+tv <- mesh$graph$tv
+
+# Calcular el centroide de cada triángulo
+centroides <- data.frame(
+  x = (mesh$loc[tv[, 1], 1] + mesh$loc[tv[, 2], 1] + mesh$loc[tv[, 3], 1]) / 3,
+  y = (mesh$loc[tv[, 1], 2] + mesh$loc[tv[, 2], 2] + mesh$loc[tv[, 3], 2]) / 3
+)
+
+centroides_sf <- st_as_sf(centroides, coords = c("x", "y"), crs = 32616)
+
+# Buffer pequeño sobre México para incluir bordes costeros e insulares
+mexico_borde <- st_buffer(mexico_proj, dist = 50)
+
+# Triángulos cuyo centroide cae dentro del polígono ampliado
+triangulos_validos <- st_within(centroides_sf, mexico_borde, sparse = FALSE)[, 1]
+tv_validos          <- tv[triangulos_validos, ]
+
+#  RECONSTRUIR ARISTAS DE LOS TRIÁNGULOS VÁLIDOS 
+edges_validos <- rbind(
+  cbind(tv_validos[, 1], tv_validos[, 2]),
+  cbind(tv_validos[, 2], tv_validos[, 3]),
+  cbind(tv_validos[, 1], tv_validos[, 3])
+)
+
+mesh_df_validos <- data.frame(
+  x    = mesh$loc[edges_validos[, 1], 1],
+  y    = mesh$loc[edges_validos[, 1], 2],
+  xend = mesh$loc[edges_validos[, 2], 1],
+  yend = mesh$loc[edges_validos[, 2], 2]
+)
+
+#  VISUALIZACIÓN
+ggplot() +
+
+  geom_sf(data = mexico_proj,
+          fill = "grey95", color = "grey40", linewidth = 0.5) +
+
+  geom_segment(data = mesh_df_validos,
+               aes(x = x, y = y, xend = xend, yend = yend),
+               color = "steelblue", linewidth = 0.2, alpha = 0.7) +
+
+  geom_point(data = data_for_plot,
+             aes(x = X, y = Y, fill = agbd),
+             shape = 21, size = 2.5, color = "white", stroke = 0.3) +
+
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+
+  scale_fill_gradientn(
+    colors = c("#ffffcc", "#78c679", "#238443", "#004529"),
+    name   = "Biomasa\n(Mg/ha)"
+  ) +
+
+  labs(
+    title    = "Malla SPDE — México",
+    subtitle = paste0("Triángulos: ", sum(triangulos_validos), " | Nodos: ", mesh$n),
+    caption  = "Fuente: INFyS - CONAFOR",
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+k = mesh$n 
+print(paste("Número de vértices de la malla (k):", k))
+```
+
+
+```{r}
+######################## INTERPOLATING OUR MESH TO EACH PLOT ##################
+
+options(repr.plot.width=8, repr.plot.height=5)
+
+
+
+loc.plot = data.matrix(loc.plot)
+A.plot = inla.spde.make.A(mesh = mesh, loc = loc.plot)
+
+
+paste("These are the number of rows (NFI plots) times the number of columns (vertices) in our mesh:", dim(A.plot)[1], "and", dim(A.plot)[2]) 
+
+```
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Definición de Modelos Espaciales SPDE)
+
+######################## MAKING A SPATIAL MODEL FOR ALPHA, BETA AND ETA  ##################
+
+# This part is a little tricky. What you want to do is establish that alpha_tilde, beta_tilde, and eta_tilde 
+# must be modelled with a covariance function, such that covariance between any two locations will depend on the relative 
+# distance between them. There are many ways to define this function, but commonly used family of covariance function is the 
+# Matérn covariance function. Matérn covariance function is probably the most commonly used one in geostatistics. 
+# We do not want to dive into the math here (we can do that later), but let's, for now, understand just this: 
+
+# Taking alpha_tilde as an example, we want to know the "range" (in units of meters) at which alpha_tilde will 
+# decay in correlation with distance. Similarly, we want to know the "range" at which beta_tilde and eta_tilde decays. 
+# And, we want to know what is the standard deviation (SD) of the Guassian process. 
+
+# In the followng, we simply supply these spatial models using INLA. We also supply some "prior probability" bound on the data, meaning, we give 
+# INLA a starting point to optimize the model fitting. This is just a best guess on how the spatially-varying parameters are expected to behave. 
+
+# Priors for the varying intercept alpha_tilde
+spde.alpha = inla.spde2.pcmatern(mesh, 
+                                 prior.range = c(30*10^3, 0.01), # This says the probability that the range is LESS than 30 km is 0.01
+                                 prior.sigma = c(60, 0.01)) # This says the probability that the SD is GREATER than 60 Mg/ha is 0.01
+
+# Priors for the varying coefficient beta_tilde
+spde.beta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations as above here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the SD is GREATER than 1 is 0.5
+
+# Priors for the varying coefficient eta_tilde
+spde.eta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations as above here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the SD is GREATER than 1 is 0.5
+
+# If you are keen on understanding the range and SD parameters and intuitively see how the work, here is a nice simulation: 
+```
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Preparación de Datos para INLA)
+
+###################### SETTING UP THE MODEL SO THAT INLA CAN RUN IT ##################
+
+# This cell simply rearranges all the data we have into the right syntax/format needed by INLA to solve the model. 
+# Let's have a recap what data we have:  
+# (1) We have NFI AGBD, CCI AGBD and Forest Height at each NFI location
+# (2) We have an awesome mesh covering Mexico in little triangles that encompass the NFI plot locations
+# (3) We have a projector matrix (A.plot), which gives each NFI location 3 weights from the nearest vertices of the containing triangle
+# (4) We have a spatial-model that will help us understand the spatially-varying errors alpha-tilde, beta-tilde, and eta-tilde
+
+### First, we just construct our formula, which we need to provide to INLA #####
+formula = agbd ~ # This is the NFI-estimated AGBD, which we have to predict
+  -1 +           # This informs INLA that it should not use a default intercept, but use the one we provide
+  intercept +    # Intercept
+  cci +          # CCI values
+  hei +          # Forest height values
+  f(alpha.spat, model = spde.alpha) + # Spatially-varying error term, modelled with spde.alpha
+  f(beta.spat, model = spde.beta) +   # Spatially-varying error term, modelled with spde.beta
+  f(eta.spat, model = spde.eta)       # Spatially-varying error term, modelled with spde.eta
+
+#### Second, we arrange our data so we can supply it to INLA to input in the formula above #####
+# The INLA stack is provided as three separate lists: 
+# (1) The "data" list, which is only our NFI-estimated AGBD at each plot
+# (2) The "A" list, which contains our projection matrices for each model parameter. For alpha, beta and eta, this is just 1. 
+#     But for alpha-tilde, beta-tilde and eta-tilde, we use A.plot to "project" on our mesh nodes! 
+# (3) The "effects" list, which contains the actual values of our model parameters. We have observations of CCI and Forest 
+#     height. For all other model parameters (i.e. the intercept and the random effects), we just supply an index.  
+n.plot <- length(agbd.plot)
+stack = inla.stack(data = list(agbd = agbd.plot),
+                   A = list(1, # tell INLA we expect an intercept, and the projection matrix is just "1"
+                            1, # tell INLA we expect a cci biomass value, and the projection matrix for its parameter is just "1"
+                            1, # tell INLA we expect a forest height value, and the projection matrix for its parameter is just "1"
+                            A.plot, # tell INLA we have a mesh projected onto the plot locations for alpha-tilde 
+                            Diagonal(x = cci.plot)%*%A.plot, # tell INLA to multiply our mesh with CCI values for beta-tilde
+                            Diagonal(x = hei.plot)%*%A.plot),# tell INLA to multiply our mesh with forest height values for eta-tilde
+                   effects = list(
+                     intercept = rep(1, n.plot), # The intercept just given an index equal to 1
+                     cci = cci.plot, # Supply INLA with the CCI values
+                     hei = hei.plot, # Supply INLA with the Forest Height values
+                     alpha.spat = 1:k, # The random effects just need to given unique indices at each mesh node.
+                     beta.spat = 1:k, # The random effects just need to given unique indices at each mesh node.
+                     eta.spat = 1:k # The random effects just need to given unique indices at each mesh node.
+                   ))
+```
+
+---
+
+## MODELO 1: Raíz Cuadrada (SQRT) 
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Ajuste del Primer Modelo INLA)
+
+
+# MODELO CON TRANSFORMACION: RAIZ CUADRADA
+
+
+cat("\n")
+
+cat(" TRANSFORMACION APLICADA: RAIZ CUADRADA (SQRT)       \n")
+
+
+# Aplicar transformación
+agbd.plot_sqrt <- sqrt(agbd.plot)
+
+cat("Rango original:", range(agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_sqrt, na.rm = TRUE), "\n\n")
+
+# Crear stack específico para el modelo SQRT
+stack_sqrt = inla.stack(data = list(agbd = agbd.plot_sqrt),
+                   A = list(1, 1, 1, A.plot,
+                            Diagonal(x = cci.plot)%*%A.plot,
+                            Diagonal(x = hei.plot)%*%A.plot),
+                   effects = list(
+                     intercept = rep(1, n.plot),
+                     cci = cci.plot,
+                     hei = hei.plot,
+                     alpha.spat = 1:k,
+                     beta.spat = 1:k,
+                     eta.spat = 1:k
+                   ))
+
+###################### SET THE MODEL RUNNING ###############################
+model_fit = inla(formula = formula,
+                 family = 'gaussian',
+                 data = inla.stack.data(stack_sqrt),
+                 control.predictor = list(A = inla.stack.A(stack_sqrt)),
+                 control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+                 verbose = TRUE)
+
+summary(model_fit)
+
+
+# COEFICIENTES MÁS PROBABLES DEL MODELO SQRT
+
+cat("\n")
+
+cat("  COEFICIENTES MÁS PROBABLES - MODELO SQRT (Raíz Cuadrada)\n")
+
+
+coef_table <- model_fit$summary.fixed[, c("mean", "sd", "0.025quant", "0.5quant", "0.975quant")]
+rownames(coef_table) <- c("Alpha (Intercepto)", "Beta (CCI)", "Eta (GEDI)")
+
+cat("Interpretación: sqrt(Biomasa) = Alpha + Beta × CCI + Eta × GEDI + efectos espaciales\n\n")
+print(round(coef_table, 4))
+
+cat("\n")
+cat("Valores más probables (media posterior):\n")
+cat("  • Alpha (Intercepto): ", round(model_fit$summary.fixed[1, "mean"], 4),
+    " ± ", round(model_fit$summary.fixed[1, "sd"], 4), "\n")
+cat("  • Beta (CCI):         ", round(model_fit$summary.fixed[2, "mean"], 4),
+    " ± ", round(model_fit$summary.fixed[2, "sd"], 4), "\n")
+cat("  • Eta (GEDI):         ", round(model_fit$summary.fixed[3, "mean"], 4),
+    " ± ", round(model_fit$summary.fixed[3, "sd"], 4), "\n")
+cat("\nIntervalos de credibilidad al 95%:\n")
+cat("  • Alpha: [", round(model_fit$summary.fixed[1, "0.025quant"], 4), ", ",
+    round(model_fit$summary.fixed[1, "0.975quant"], 4), "]\n")
+cat("  • Beta:  [", round(model_fit$summary.fixed[2, "0.025quant"], 4), ", ",
+    round(model_fit$summary.fixed[2, "0.975quant"], 4), "]\n")
+cat("  • Eta:   [", round(model_fit$summary.fixed[3, "0.025quant"], 4), ", ",
+    round(model_fit$summary.fixed[3, "0.975quant"], 4), "]\n")
+cat("══════════════════════════════════════════════════════════════════════════════\n\n")
+
+
+# DIAGNOSTICO DEL MODELO SQRT
+
+pit_sqrt <- model_fit$cpo$pit[!is.na(model_fit$cpo$pit)]
+ks_sqrt <- ks.test(pit_sqrt, "punif")
+
+cat("DIC:", round(model_fit$dic$dic, 2), "\n")
+cat("WAIC:", round(model_fit$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_sqrt), 4), "\n")
+cat("PIT SD:", round(sd(pit_sqrt), 4), "\n")
+cat("KS p-valor:", format(ks_sqrt$p.value, digits = 4), "\n\n")
+
+# Histograma PIT para diagnóstico del modelo
+hist(model_fit$cpo$pit, breaks = 20,
+     main = "Distribución PIT - Modelo SQRT",
+     xlab = "Valores PIT",
+     ylab = "Frecuencia",
+     col = "#3498db",
+     border = "white",
+     las = 1)
+
+# Guardar modelo en GMB_MODIFICADO
+save(model_fit, file = file.path(output_dir, "INLA_model_fit.RData"))
+```
+
+---
+
+## TRANSFORMACION 2: Logaritmo Natural (LOG)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO CON TRANSFORMACIÓN: LOGARITMO NATURAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "log"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: LOGARITMO NATURAL (LOG)              ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Aplicar transformación
+agbd.plot_log <- log1p(agbd.plot)  # log(1+x) para evitar log(0)
+
+cat("Rango original:", range(agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_log, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_log = inla.stack(
+  data = list(agbd = agbd.plot_log),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_log = inla(
+  formula = formula,  # Misma fórmula
+  family = 'gaussian',
+  data = inla.stack.data(stack_log),
+  control.predictor = list(A = inla.stack.A(stack_log)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+summary(model_log)
+
+# ============================================================================
+# COEFICIENTES MÁS PROBABLES DEL MODELO LOG
+# ============================================================================
+cat("\n")
+cat("══════════════════════════════════════════════════════════════════════════════\n")
+cat("  COEFICIENTES MÁS PROBABLES - MODELO LOG (Logaritmo Natural)\n")
+cat("══════════════════════════════════════════════════════════════════════════════\n\n")
+
+coef_table_log <- model_log$summary.fixed[, c("mean", "sd", "0.025quant", "0.5quant", "0.975quant")]
+rownames(coef_table_log) <- c("Alpha (Intercepto)", "Beta (CCI)", "Eta (GEDI)")
+
+cat("Interpretación: log(1 + Biomasa) = Alpha + Beta × CCI + Eta × GEDI + efectos espaciales\n\n")
+print(round(coef_table_log, 4))
+
+cat("\n")
+cat("Valores más probables (media posterior):\n")
+cat("  • Alpha (Intercepto): ", round(model_log$summary.fixed[1, "mean"], 4),
+    " ± ", round(model_log$summary.fixed[1, "sd"], 4), "\n")
+cat("  • Beta (CCI):         ", round(model_log$summary.fixed[2, "mean"], 4),
+    " ± ", round(model_log$summary.fixed[2, "sd"], 4), "\n")
+cat("  • Eta (GEDI):         ", round(model_log$summary.fixed[3, "mean"], 4),
+    " ± ", round(model_log$summary.fixed[3, "sd"], 4), "\n")
+cat("\nIntervalos de credibilidad al 95%:\n")
+cat("  • Alpha: [", round(model_log$summary.fixed[1, "0.025quant"], 4), ", ",
+    round(model_log$summary.fixed[1, "0.975quant"], 4), "]\n")
+cat("  • Beta:  [", round(model_log$summary.fixed[2, "0.025quant"], 4), ", ",
+    round(model_log$summary.fixed[2, "0.975quant"], 4), "]\n")
+cat("  • Eta:   [", round(model_log$summary.fixed[3, "0.025quant"], 4), ", ",
+    round(model_log$summary.fixed[3, "0.975quant"], 4), "]\n")
+cat("══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# ============================================================================
+# DIAGNOSTICO DEL MODELO LOG
+# ============================================================================
+pit_log <- model_log$cpo$pit[!is.na(model_log$cpo$pit)]
+ks_log <- ks.test(pit_log, "punif")
+
+cat("DIC:", round(model_log$dic$dic, 2), "\n")
+cat("WAIC:", round(model_log$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_log), 4), "\n")
+cat("PIT SD:", round(sd(pit_log), 4), "\n")
+cat("KS p-valor:", format(ks_log$p.value, digits = 4), "\n\n")
+
+# Histograma PIT para diagnóstico del modelo
+hist(model_log$cpo$pit, breaks = 20,
+     main = "Distribución PIT - Modelo LOG",
+     xlab = "Valores PIT",
+     ylab = "Frecuencia",
+     col = "#e74c3c",
+     border = "white",
+     las = 1)
+
+# Guardar modelo
+save(model_log, file = file.path(output_dir, "INLA_model_log.RData"))
+```
+
+---
+
+## TRANSFORMACIÓN 4: Sin Transformación (DATOS ORIGINALES)
+
+```{r}
+
+# MODELO SIN TRANSFORMACIÓN (DATOS ORIGINALES)
+
+
+TRANSFORMACION <- "none"
+cat("\n")
+
+cat("║  TRANSFORMACIÓN APLICADA: NINGUNA (DATOS ORIGINALES)           ║\n")
+
+
+# Sin transformación
+agbd.plot_none <- agbd.plot
+
+cat("Rango de datos:", range(agbd.plot_none, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_none = inla.stack(
+  data = list(agbd = agbd.plot_none),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_none = inla(
+  formula = formula,
+  family = 'gaussian',
+  data = inla.stack.data(stack_none),
+  control.predictor = list(A = inla.stack.A(stack_none)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+summary(model_none)
+
+
+cat("\n")
+
+cat("  COEFICIENTES MÁS PROBABLES - MODELO NONE (Sin Transformación)\n")
+
+
+coef_table_none <- model_none$summary.fixed[, c("mean", "sd", "0.025quant", "0.5quant", "0.975quant")]
+rownames(coef_table_none) <- c("Alpha (Intercepto)", "Beta (CCI)", "Eta (GEDI)")
+
+cat("Interpretación: Biomasa = Alpha + Beta × CCI + Eta × GEDI + efectos espaciales\n\n")
+print(round(coef_table_none, 4))
+
+cat("\n")
+cat("Valores más probables (media posterior):\n")
+cat("  • Alpha (Intercepto): ", round(model_none$summary.fixed[1, "mean"], 4),
+    " ± ", round(model_none$summary.fixed[1, "sd"], 4), "\n")
+cat("  • Beta (CCI):         ", round(model_none$summary.fixed[2, "mean"], 4),
+    " ± ", round(model_none$summary.fixed[2, "sd"], 4), "\n")
+cat("  • Eta (GEDI):         ", round(model_none$summary.fixed[3, "mean"], 4),
+    " ± ", round(model_none$summary.fixed[3, "sd"], 4), "\n")
+cat("\nIntervalos de credibilidad al 95%:\n")
+cat("  • Alpha: [", round(model_none$summary.fixed[1, "0.025quant"], 4), ", ",
+    round(model_none$summary.fixed[1, "0.975quant"], 4), "]\n")
+cat("  • Beta:  [", round(model_none$summary.fixed[2, "0.025quant"], 4), ", ",
+    round(model_none$summary.fixed[2, "0.975quant"], 4), "]\n")
+cat("  • Eta:   [", round(model_none$summary.fixed[3, "0.025quant"], 4), ", ",
+    round(model_none$summary.fixed[3, "0.975quant"], 4), "]\n")
+cat("══════════════════════════════════════════════════════════════════════════════\n\n")
+
+
+pit_none <- model_none$cpo$pit[!is.na(model_none$cpo$pit)]
+ks_none <- ks.test(pit_none, "punif")
+
+cat("DIC:", round(model_none$dic$dic, 2), "\n")
+cat("WAIC:", round(model_none$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_none), 4), "\n")
+cat("PIT SD:", round(sd(pit_none), 4), "\n")
+cat("KS p-valor:", format(ks_none$p.value, digits = 4), "\n\n")
+
+# Histograma PIT para diagnóstico del modelo
+hist(model_none$cpo$pit, breaks = 20,
+     main = "Distribución PIT - Modelo NONE",
+     xlab = "Valores PIT",
+     ylab = "Frecuencia",
+     col = "#2ecc71",
+     border = "white",
+     las = 1)
+
+# Guardar modelo
+save(model_none, file = file.path(output_dir, "INLA_model_none.RData"))
+```
+
+---
+
+## COMPARACION ENTRE LOS TRES MODELOS
+
+```{r}
+
+
+
+cat("               COMPARACIÓN DE COEFICIENTES ENTRE MODELOS                    \n")
+
+# Crear tabla comparativa
+comparacion <- data.frame(
+  Coeficiente = c("Alpha (Intercepto)", "Beta (CCI)", "Eta (GEDI)"),
+
+  SQRT_Media = round(model_fit$summary.fixed$mean, 4),
+  SQRT_SD = round(model_fit$summary.fixed$sd, 4),
+
+  LOG_Media = round(model_log$summary.fixed$mean, 4),
+  LOG_SD = round(model_log$summary.fixed$sd, 4),
+
+  NONE_Media = round(model_none$summary.fixed$mean, 4),
+  NONE_SD = round(model_none$summary.fixed$sd, 4)
+)
+
+print(comparacion, row.names = FALSE)
+
+cat("\n")
+
+cat("  MÉTRICAS DE AJUSTE DEL MODELO\n")
+
+
+metricas <- data.frame(
+  Modelo = c("SQRT", "LOG", "NONE"),
+  DIC = round(c(model_fit$dic$dic, model_log$dic$dic, model_none$dic$dic), 2),
+  WAIC = round(c(model_fit$waic$waic, model_log$waic$waic, model_none$waic$waic), 2),
+  PIT_Media = round(c(
+    mean(model_fit$cpo$pit, na.rm = TRUE),
+    mean(model_log$cpo$pit, na.rm = TRUE),
+    mean(model_none$cpo$pit, na.rm = TRUE)
+  ), 4),
+  PIT_SD = round(c(
+    sd(model_fit$cpo$pit, na.rm = TRUE),
+    sd(model_log$cpo$pit, na.rm = TRUE),
+    sd(model_none$cpo$pit, na.rm = TRUE)
+  ), 4)
+)
+
+print(metricas, row.names = FALSE)
+
+cat("\n")
+cat("NOTAS:\n")
+cat("  • DIC y WAIC: Menores valores indican mejor ajuste\n")
+cat("  • PIT Media: Debe estar cerca de 0.5 para un modelo bien calibrado\n")
+cat("  • PIT SD: Debe estar cerca de 0.289 (SD de Uniforme[0,1])\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n\n")
+
+# Mejor modelo según DIC
+mejor_dic <- metricas$Modelo[which.min(metricas$DIC)]
+mejor_waic <- metricas$Modelo[which.min(metricas$WAIC)]
+
+cat("MEJOR MODELO SEGUN DIC:  ", mejor_dic, "\n")
+cat("MEJOR MODELO SEGUN WAIC: ", mejor_waic, "\n\n")
+```
+
+---
+
+## VALIDACIÓN CON CONJUNTO DE PRUEBA (10%)
+
+```{r}
+
+# VALIDACIÓN DE LOS 3 MODELOS CON EL CONJUNTO DE PRUEBA
+
+cat("\n")
+
+cat("     VALIDACIÓN CON CONJUNTO DE PRUEBA (10% de datos)               \n")
+
+
+# Preparar datos de prueba
+plot_test <- plot_WGS84_T %>% st_transform("epsg:32616")
+loc.plot.test <- st_coordinates(plot_test)
+agbd.plot.test <- plot_test$biomasa_Mg_ha
+
+# Extraer covariables para el conjunto de prueba
+cci.plot.test <- exactextractr::exact_extract(cci.rast, st_buffer(plot_test, 56.42), 'mean')
+hei.plot.test <- exactextractr::exact_extract(hei.rast, st_buffer(plot_test, 56.42), 'mean')
+
+# Crear matriz de proyección para puntos de prueba
+A.plot.test <- inla.spde.make.A(mesh = mesh, loc = loc.plot.test)
+
+
+# PREDICCIONES DEL MODELO SQRT
+
+
+# Coeficientes fijos
+alpha_sqrt <- model_fit$summary.fixed[1, "mean"]
+beta_sqrt <- model_fit$summary.fixed[2, "mean"]
+eta_sqrt <- model_fit$summary.fixed[3, "mean"]
+
+# Efectos espaciales en puntos de prueba
+alpha_spat_test_sqrt <- as.vector(A.plot.test %*% model_fit$summary.random[[1]]$mean)
+beta_spat_test_sqrt <- as.vector(A.plot.test %*% model_fit$summary.random[[2]]$mean)
+eta_spat_test_sqrt <- as.vector(A.plot.test %*% model_fit$summary.random[[3]]$mean)
+
+# Predicción (en escala transformada)
+pred_sqrt_trans <- (alpha_sqrt + alpha_spat_test_sqrt) +
+                   (beta_sqrt + beta_spat_test_sqrt) * cci.plot.test +
+                   (eta_sqrt + eta_spat_test_sqrt) * hei.plot.test
+
+# Volver a escala original
+pred_sqrt <- pred_sqrt_trans^2
+
+
+# PREDICCIONES DEL MODELO LOG
+
+
+alpha_log <- model_log$summary.fixed[1, "mean"]
+beta_log <- model_log$summary.fixed[2, "mean"]
+eta_log <- model_log$summary.fixed[3, "mean"]
+
+alpha_spat_test_log <- as.vector(A.plot.test %*% model_log$summary.random[[1]]$mean)
+beta_spat_test_log <- as.vector(A.plot.test %*% model_log$summary.random[[2]]$mean)
+eta_spat_test_log <- as.vector(A.plot.test %*% model_log$summary.random[[3]]$mean)
+
+pred_log_trans <- (alpha_log + alpha_spat_test_log) +
+                  (beta_log + beta_spat_test_log) * cci.plot.test +
+                  (eta_log + eta_spat_test_log) * hei.plot.test
+
+pred_log <- expm1(pred_log_trans)  # exp(x) - 1, inversa de log1p
+
+
+# PREDICCIONES DEL MODELO NONE
+
+
+alpha_none <- model_none$summary.fixed[1, "mean"]
+beta_none <- model_none$summary.fixed[2, "mean"]
+eta_none <- model_none$summary.fixed[3, "mean"]
+
+alpha_spat_test_none <- as.vector(A.plot.test %*% model_none$summary.random[[1]]$mean)
+beta_spat_test_none <- as.vector(A.plot.test %*% model_none$summary.random[[2]]$mean)
+eta_spat_test_none <- as.vector(A.plot.test %*% model_none$summary.random[[3]]$mean)
+
+pred_none <- (alpha_none + alpha_spat_test_none) +
+             (beta_none + beta_spat_test_none) * cci.plot.test +
+             (eta_none + eta_spat_test_none) * hei.plot.test
+
+
+# RETRANSFORMACIÓN A ESCALA ORIGINAL CON CORRECCIÓN DE SESGO DE JENSEN
+
+
+cat("\n")
+
+
+
+
+cat("EXTRACCIÓN DE HIPERPARÁMETROS DE VARIANZA\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Mostrar nombres disponibles de hiperparámetros
+cat("Hiperparámetros disponibles en model_fit (SQRT):\n")
+print(rownames(model_fit$summary.hyperpar))
+cat("\n")
+
+cat("Hiperparámetros disponibles en model_log (LOG):\n")
+print(rownames(model_log$summary.hyperpar))
+cat("\n")
+
+# MODELO SQRT: Extraer precisión con manejo de errores
+
+cat("MODELO SQRT - Extracción de parámetros\n")
+
+
+# Intentar diferentes nombres posibles del hiperparámetro
+nombres_posibles <- c(
+  "Precision for the Gaussian observations",
+  "Precision for Gaussian observations",
+  "precision for the gaussian observations",
+  "Precision"
+)
+
+precision_sqrt <- NA
+for (nombre in nombres_posibles) {
+  if (nombre %in% rownames(model_fit$summary.hyperpar)) {
+    precision_sqrt <- model_fit$summary.hyperpar[nombre, "mean"]
+    cat("✓ Encontrado con nombre:", nombre, "\n")
+    break
+  }
+}
+
+# Si no se encuentra, usar el primer hiperparámetro (usualmente es la precisión)
+if (is.na(precision_sqrt)) {
+  cat("⚠ No se encontró por nombre exacto. Usando primer hiperparámetro.\n")
+  precision_sqrt <- model_fit$summary.hyperpar[1, "mean"]
+  cat("  Nombre del hiperparámetro usado:", rownames(model_fit$summary.hyperpar)[1], "\n")
+}
+
+sigma2_sqrt <- 1 / precision_sqrt  # Varianza del error en escala transformada
+sigma_sqrt <- sqrt(sigma2_sqrt)
+
+cat("  • Precisión (τ):", sprintf("%.4f", precision_sqrt), "\n")
+cat("  • Varianza (σ²):", sprintf("%.6f", sigma2_sqrt), "\n")
+cat("  • Desv. Estándar (σ):", sprintf("%.4f", sigma_sqrt), "\n\n")
+
+# MODELO LOG: Extraer precisión con manejo de errores
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+cat("MODELO LOG - Extracción de parámetros\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+
+precision_log <- NA
+for (nombre in nombres_posibles) {
+  if (nombre %in% rownames(model_log$summary.hyperpar)) {
+    precision_log <- model_log$summary.hyperpar[nombre, "mean"]
+    cat("✓ Encontrado con nombre:", nombre, "\n")
+    break
+  }
+}
+
+if (is.na(precision_log)) {
+  cat("⚠ No se encontró por nombre exacto. Usando primer hiperparámetro.\n")
+  precision_log <- model_log$summary.hyperpar[1, "mean"]
+  cat("  Nombre del hiperparámetro usado:", rownames(model_log$summary.hyperpar)[1], "\n")
+}
+
+sigma2_log <- 1 / precision_log
+sigma_log <- sqrt(sigma2_log)
+
+cat("  • Precisión (τ):", sprintf("%.4f", precision_log), "\n")
+cat("  • Varianza (σ²):", sprintf("%.6f", sigma2_log), "\n")
+cat("  • Desv. Estándar (σ):", sprintf("%.4f", sigma_log), "\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VERIFICACIÓN: ¿Es la corrección de Jensen apropiada para SQRT?
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("VERIFICACIÓN MATEMÁTICA: CORRECCIÓN DE JENSEN PARA RAÍZ CUADRADA\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("Para la transformación raíz cuadrada:\n\n")
+cat("  Modelo ajustado: √Biomasa = α + β·CCI + η·GEDI + ε\n")
+cat("  Donde ε ~ N(0, σ²)\n\n")
+cat("  Entonces: √Biomasa_pred ~ N(μ_pred, σ²)\n\n")
+cat("  Para retransformar a Biomasa, elevamos al cuadrado:\n")
+cat("  Biomasa = (√Biomasa_pred)²\n\n")
+
+cat("  Si W ~ N(μ, σ²), entonces:\n")
+cat("  E[W²] = μ² + σ²    (por definición de varianza)\n\n")
+
+cat("  Por lo tanto, la corrección de Jensen ES VÁLIDA:\n")
+cat("  E[Biomasa] = E[(√Biomasa_pred)²] = (μ_pred)² + σ²\n\n")
+
+cat("  En este caso:\n")
+cat("  σ² = ", sprintf("%.6f", sigma2_sqrt), " (en escala transformada)\n\n")
+
+cat("  Magnitud de la corrección por observación:\n")
+cat("  Corrección = σ² = ", sprintf("%.6f", sigma2_sqrt), " ",
+    "en escala de √(Mg/ha)\n")
+cat("  Equivalente a: ", sprintf("%.6f", sigma2_sqrt), " Mg/ha adicionales\n\n")
+
+if (sigma2_sqrt < 0.01) {
+  cat("  ⚠ ADVERTENCIA: La varianza es muy pequeña (< 0.01)\n")
+  cat("     Esto indica que el modelo ajusta muy bien en escala transformada.\n")
+  cat("     La corrección de Jensen será mínima (< 0.01 Mg/ha).\n\n")
+  cat("     DECISIÓN: Debido a la magnitud despreciable, la corrección\n")
+  cat("               puede considerarse OPCIONAL para este modelo.\n\n")
+}
+
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CORRECCIÓN DEL SESGO DE JENSEN
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("RETRANSFORMACIÓN CON CORRECCIÓN DE SESGO\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# ---- MODELO SQRT ----
+cat("1️⃣  MODELO SQRT (Raíz Cuadrada)\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n\n")
+
+# Predicciones sin corrección (ya calculadas)
+pred_sqrt_sin_correccion <- pred_sqrt_trans^2
+
+cat("Fórmula sin corrección:\n")
+cat("  Biomasa_pred = (√Biomasa_pred)²\n\n")
+
+# Predicciones con corrección de sesgo de Jensen
+# Para transformación cuadrática: E[Y²] = E[Y]² + Var[Y]
+# Entonces: Biomasa = (pred_trans)² + sigma2_sqrt
+pred_sqrt_con_correccion <- pred_sqrt_trans^2 + sigma2_sqrt
+
+cat("Fórmula con corrección de Jensen:\n")
+cat("  Biomasa_pred = (√Biomasa_pred)² + σ²\n")
+cat("  Biomasa_pred = ", "predicción² + ", round(sigma2_sqrt, 6), "\n\n")
+
+# Estadísticas de corrección
+diferencia_sqrt <- pred_sqrt_con_correccion - pred_sqrt_sin_correccion
+cat("Estadísticas de la corrección:\n")
+cat("  • Diferencia promedio:", sprintf("%.6f", mean(diferencia_sqrt)), "Mg/ha\n")
+cat("  • Diferencia mínima:", sprintf("%.6f", min(diferencia_sqrt)), "Mg/ha\n")
+cat("  • Diferencia máxima:", sprintf("%.6f", max(diferencia_sqrt)), "Mg/ha\n")
+
+if (mean(abs(diferencia_sqrt)) > 0.001) {
+  cat("  • % cambio promedio:", round(mean(abs(diferencia_sqrt) / pred_sqrt_sin_correccion) * 100, 4), "%\n")
+} else {
+  cat("  • % cambio promedio: < 0.001% (despreciable)\n")
+}
+
+cat("\n")
+if (sigma2_sqrt < 0.01) {
+  cat("  ⚠ CONCLUSIÓN SQRT: La corrección es DESPRECIABLE (σ² = ",
+      sprintf("%.6f", sigma2_sqrt), " < 0.01)\n")
+  cat("     El modelo ajusta muy bien en escala transformada.\n")
+  cat("     RECOMENDACIÓN: La corrección puede OMITIRSE sin consecuencias prácticas.\n")
+  cat("                    Diferencia promedio: ", sprintf("%.6f", mean(diferencia_sqrt)), " Mg/ha\n")
+} else {
+  cat("  ✓ CONCLUSIÓN SQRT: La corrección es SIGNIFICATIVA (σ² = ",
+      sprintf("%.6f", sigma2_sqrt), ")\n")
+  cat("     RECOMENDACIÓN: Debe aplicarse para estimaciones insesgadas.\n")
+}
+cat("\n")
+
+# ---- MODELO LOG ----
+cat("2️⃣  MODELO LOG (Logaritmo Natural)\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n\n")
+
+# Predicciones sin corrección (ya calculadas)
+pred_log_sin_correccion <- expm1(pred_log_trans)
+
+cat("Fórmula sin corrección:\n")
+cat("  Biomasa_pred = exp(log_pred) - 1\n\n")
+
+# Predicciones con corrección de sesgo de Jensen
+# Para transformación exponencial: E[exp(Y)] = exp(E[Y] + Var[Y]/2)
+# Entonces: Biomasa = exp(pred_trans + sigma2_log/2) - 1
+pred_log_con_correccion <- expm1(pred_log_trans + sigma2_log/2)
+
+cat("Fórmula con corrección de Jensen:\n")
+cat("  Biomasa_pred = exp(log_pred + σ²/2) - 1\n")
+cat("  Biomasa_pred = exp(log_pred + ", round(sigma2_log/2, 6), ") - 1\n\n")
+
+# Estadísticas de corrección
+diferencia_log <- pred_log_con_correccion - pred_log_sin_correccion
+cat("Estadísticas de la corrección:\n")
+cat("  • Diferencia promedio:", sprintf("%.4f", mean(diferencia_log)), "Mg/ha\n")
+cat("  • Diferencia mínima:", sprintf("%.4f", min(diferencia_log)), "Mg/ha\n")
+cat("  • Diferencia máxima:", sprintf("%.4f", max(diferencia_log)), "Mg/ha\n")
+
+if (mean(abs(diferencia_log)) > 0.01) {
+  cat("  • % cambio promedio:", round(mean(abs(diferencia_log) / pred_log_sin_correccion) * 100, 2), "%\n")
+} else {
+  cat("  • % cambio promedio: < 0.01% (muy pequeño)\n")
+}
+
+cat("\n")
+if (mean(abs(diferencia_log)) < 0.1) {
+  cat("  ⚠ CONCLUSIÓN LOG: La corrección es PEQUEÑA (< 0.1 Mg/ha promedio)\n")
+  cat("     El modelo ajusta bien en escala transformada.\n")
+  cat("     RECOMENDACIÓN: La corrección es opcional pero recomendable.\n")
+  cat("                    Diferencia promedio: ", sprintf("%.4f", mean(diferencia_log)), " Mg/ha\n")
+} else {
+  cat("  ✓ CONCLUSIÓN LOG: La corrección es SIGNIFICATIVA (>= 0.1 Mg/ha promedio)\n")
+  cat("     RECOMENDACIÓN: Debe aplicarse para estimaciones insesgadas.\n")
+  cat("                    Diferencia promedio: ", sprintf("%.4f", mean(diferencia_log)), " Mg/ha\n")
+}
+cat("\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ACTUALIZAR PREDICCIONES CON CORRECCIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("DECISIÓN INTELIGENTE: ¿Usar corrección de sesgo?\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Guardar ambas versiones para comparación
+pred_sqrt_original <- pred_sqrt_sin_correccion
+pred_log_original <- pred_log_sin_correccion
+pred_sqrt_corregido <- pred_sqrt_con_correccion
+pred_log_corregido <- pred_log_con_correccion
+
+# Determinar automáticamente si la corrección es significativa
+umbral_sqrt <- 0.01  # Mg/ha
+umbral_log <- 0.1    # Mg/ha
+
+usar_corr_sqrt <- mean(abs(diferencia_sqrt)) >= umbral_sqrt
+usar_corr_log <- mean(abs(diferencia_log)) >= umbral_log
+
+cat("DECISIÓN AUTOMÁTICA BASADA EN MAGNITUD:\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n\n")
+
+cat("MODELO SQRT:\n")
+cat("  Diferencia promedio por corrección: ", sprintf("%.6f", mean(abs(diferencia_sqrt))), " Mg/ha\n")
+cat("  Umbral de significancia: ", umbral_sqrt, " Mg/ha\n")
+if (usar_corr_sqrt) {
+  cat("  ✓ DECISIÓN: USAR corrección de Jensen (diferencia significativa)\n\n")
+} else {
+  cat("  ✗ DECISIÓN: NO USAR corrección de Jensen (diferencia despreciable)\n")
+  cat("     La corrección es < ", umbral_sqrt, " Mg/ha, puede omitirse.\n\n")
+}
+
+cat("MODELO LOG:\n")
+cat("  Diferencia promedio por corrección: ", sprintf("%.4f", mean(abs(diferencia_log))), " Mg/ha\n")
+cat("  Umbral de significancia: ", umbral_log, " Mg/ha\n")
+if (usar_corr_log) {
+  cat("  ✓ DECISIÓN: USAR corrección de Jensen (diferencia significativa)\n\n")
+} else {
+  cat("  ✗ DECISIÓN: NO USAR corrección de Jensen (diferencia pequeña)\n")
+  cat("     La corrección es < ", umbral_log, " Mg/ha, es opcional.\n\n")
+}
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("APLICANDO DECISIONES:\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Aplicar decisiones
+if (usar_corr_sqrt) {
+  pred_sqrt <- pred_sqrt_corregido
+  cat("✓ Modelo SQRT: Usando predicciones CON corrección de Jensen\n")
+} else {
+  pred_sqrt <- pred_sqrt_original
+  cat("✗ Modelo SQRT: Usando predicciones SIN corrección (magnitud despreciable)\n")
+}
+
+if (usar_corr_log) {
+  pred_log <- pred_log_corregido
+  cat("✓ Modelo LOG:  Usando predicciones CON corrección de Jensen\n")
+} else {
+  pred_log <- pred_log_original
+  cat("✗ Modelo LOG:  Usando predicciones SIN corrección (magnitud pequeña)\n")
+}
+
+cat("\nNota: Todas las métricas subsecuentes usarán las predicciones según\n")
+cat("      las decisiones anteriores basadas en significancia práctica.\n\n")
+
+cat("JUSTIFICACIÓN TEÓRICA:\n")
+cat("  • La corrección de Jensen ES matemáticamente correcta para ambas transformaciones.\n")
+cat("  • Sin embargo, cuando la varianza del error (σ²) es muy pequeña, la corrección\n")
+cat("    resulta en cambios despreciables (< 0.01 Mg/ha).\n")
+cat("  • En estos casos, omitir la corrección no afecta las conclusiones prácticas.\n")
+cat("  • Para el modelo LOG, si σ² es mayor, la corrección puede ser más sustancial.\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# También calcularemos métricas para AMBAS versiones para que el usuario pueda comparar
+cat("Se calcularán métricas de validación para AMBAS versiones:\n")
+cat("  1. SIN corrección de sesgo (retransformación simple)\n")
+cat("  2. CON corrección de sesgo de Jensen\n")
+cat("  → Esto permitirá verificar el impacto real en las métricas.\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COMPARACIÓN VISUAL: CON VS SIN CORRECCIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Datos para comparación SQRT
+datos_comp_sqrt <- data.frame(
+  Observado = rep(agbd.plot.test, 2),
+  Predicho = c(pred_sqrt_original, pred_sqrt_corregido),
+  Tipo = rep(c("Sin corrección", "Con corrección Jensen"), each = length(agbd.plot.test))
+)
+
+p1 <- ggplot(datos_comp_sqrt, aes(x = Observado, y = Predicho, color = Tipo)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Sin corrección" = "#3498db",
+                                 "Con corrección Jensen" = "#e67e22")) +
+  labs(title = "Modelo SQRT: Efecto de Corrección de Sesgo",
+       x = "Biomasa Observada (Mg/ha)",
+       y = "Biomasa Predicha (Mg/ha)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Datos para comparación LOG
+datos_comp_log <- data.frame(
+  Observado = rep(agbd.plot.test, 2),
+  Predicho = c(pred_log_original, pred_log_corregido),
+  Tipo = rep(c("Sin corrección", "Con corrección Jensen"), each = length(agbd.plot.test))
+)
+
+p2 <- ggplot(datos_comp_log, aes(x = Observado, y = Predicho, color = Tipo)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black") +
+  scale_color_manual(values = c("Sin corrección" = "#e74c3c",
+                                 "Con corrección Jensen" = "#27ae60")) +
+  labs(title = "Modelo LOG: Efecto de Corrección de Sesgo",
+       x = "Biomasa Observada (Mg/ha)",
+       y = "Biomasa Predicha (Mg/ha)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Mostrar gráficos lado a lado
+grid.arrange(p1, p2, ncol = 2)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# NOTA: Las predicciones ya fueron actualizadas en la sección de decisión automática
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("ESTADO ACTUAL DE LAS PREDICCIONES:\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+cat("✓ pred_sqrt: Contiene predicciones según decisión automática (línea ~1450)\n")
+cat("✓ pred_log:  Contiene predicciones según decisión automática (línea ~1450)\n")
+cat("✓ pred_none: Contiene predicciones sin transformación\n\n")
+cat("✓ Todas en ESCALA ORIGINAL (Mg/ha) listas para calcular métricas\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Verificación: confirmar que las predicciones están en rango razonable
+cat("VERIFICACIÓN DE RANGOS (deben estar en Mg/ha):\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+cat("pred_sqrt: [", sprintf("%.2f", min(pred_sqrt, na.rm=TRUE)), ", ",
+    sprintf("%.2f", max(pred_sqrt, na.rm=TRUE)), "] Mg/ha\n")
+cat("pred_log:  [", sprintf("%.2f", min(pred_log, na.rm=TRUE)), ", ",
+    sprintf("%.2f", max(pred_log, na.rm=TRUE)), "] Mg/ha\n")
+cat("pred_none: [", sprintf("%.2f", min(pred_none, na.rm=TRUE)), ", ",
+    sprintf("%.2f", max(pred_none, na.rm=TRUE)), "] Mg/ha\n")
+cat("Observado: [", sprintf("%.2f", min(agbd.plot.test, na.rm=TRUE)), ", ",
+    sprintf("%.2f", max(agbd.plot.test, na.rm=TRUE)), "] Mg/ha\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MÉTRICAS DE VALIDACIÓN EN UNIDADES ORIGINALES (Mg/ha)
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║          MÉTRICAS DE VALIDACIÓN - CONJUNTO DE PRUEBA (10%)                  ║\n")
+cat("║              Todas las métricas en unidades originales (Mg/ha)              ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DIAGNÓSTICO PREVIO: Verificar que todas las variables necesarias existen
+# ═════════════════════════════════════════════════════════════════════════════
+
+cat("DIAGNÓSTICO: Verificando variables necesarias...\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+
+variables_necesarias <- c("agbd.plot.test", "pred_sqrt", "pred_log", "pred_none")
+todas_existen <- TRUE
+
+for (var in variables_necesarias) {
+  if (!exists(var)) {
+    cat("✗ ERROR: Variable '", var, "' no existe\n", sep="")
+    todas_existen <- FALSE
+  } else {
+    valor <- get(var)
+    cat("✓ ", var, ": ", length(valor), " valores, rango [",
+        sprintf("%.2f", min(valor, na.rm=TRUE)), ", ",
+        sprintf("%.2f", max(valor, na.rm=TRUE)), "]\n", sep="")
+  }
+}
+
+if (!todas_existen) {
+  stop("ERROR: Faltan variables necesarias. Revise las secciones anteriores del código.")
+}
+
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+cat("✓ Todas las variables necesarias están disponibles\n\n")
+
+# Función extendida para calcular todas las métricas EN UNIDADES ORIGINALES
+calcular_metricas_completas <- function(obs, pred, nombre_modelo) {
+  # IMPORTANTE: Esta función espera obs y pred en ESCALA ORIGINAL (Mg/ha)
+  # NO deben estar transformados (ni sqrt, ni log)
+
+  # Validación: verificar que los valores son razonables
+  if (any(is.na(obs)) || any(is.na(pred))) {
+    warning(paste("Modelo", nombre_modelo, ": Hay valores NA en obs o pred"))
+  }
+  if (min(obs, na.rm=TRUE) < 0 || min(pred, na.rm=TRUE) < 0) {
+    warning(paste("Modelo", nombre_modelo, ": Hay valores negativos (revisar retransformación)"))
+  }
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # MÉTRICAS EN UNIDADES ORIGINALES (Mg/ha)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # Métricas básicas
+  n <- length(obs)
+
+  # RMSE: Error Cuadrático Medio en Mg/ha
+  rmse <- sqrt(mean((obs - pred)^2, na.rm = TRUE))
+
+  # MAE: Error Absoluto Medio en Mg/ha
+  mae <- mean(abs(obs - pred), na.rm = TRUE)
+
+  # R² y correlación (adimensionales)
+  r2 <- cor(obs, pred, use = "complete.obs")^2
+  r <- cor(obs, pred, use = "complete.obs")
+
+  # Bias: Sesgo en Mg/ha (positivo = sobreestimación, negativo = subestimación)
+  bias <- mean(pred - obs, na.rm = TRUE)
+
+  # Métricas adicionales
+  mse <- mean((obs - pred)^2, na.rm = TRUE)
+
+  # Error relativo (%)
+  mape <- mean(abs((obs - pred) / obs) * 100, na.rm = TRUE)
+
+  # Rango de valores
+  min_obs <- min(obs, na.rm = TRUE)
+  max_obs <- max(obs, na.rm = TRUE)
+  mean_obs <- mean(obs, na.rm = TRUE)
+  sd_obs <- sd(obs, na.rm = TRUE)
+
+  min_pred <- min(pred, na.rm = TRUE)
+  max_pred <- max(pred, na.rm = TRUE)
+  mean_pred <- mean(pred, na.rm = TRUE)
+  sd_pred <- sd(pred, na.rm = TRUE)
+
+  # Error estándar
+  se <- sd(obs - pred, na.rm = TRUE)
+
+  # RMSE relativo (%)
+  rmse_rel <- (rmse / mean_obs) * 100
+
+  # Crear tabla de métricas
+  tabla <- data.frame(
+    Metrica = c(
+      "Número de observaciones (n)",
+      "────────────────────────────────────────",
+      "ESTADÍSTICAS DE OBSERVACIONES",
+      "  Media observada",
+      "  Desv. estándar observada",
+      "  Mínimo observado",
+      "  Máximo observado",
+      "  Rango observado",
+      "────────────────────────────────────────",
+      "ESTADÍSTICAS DE PREDICCIONES",
+      "  Media predicha",
+      "  Desv. estándar predicha",
+      "  Mínimo predicho",
+      "  Máximo predicho",
+      "  Rango predicho",
+      "────────────────────────────────────────",
+      "MÉTRICAS DE PRECISIÓN",
+      "  R² (Coef. Determinación)",
+      "  r (Correlación de Pearson)",
+      "  RMSE (Error Cuadrático Medio)",
+      "  RMSE relativo",
+      "  MAE (Error Absoluto Medio)",
+      "  MSE (Error Cuadrático Medio)",
+      "  MAPE (Error Absoluto % Medio)",
+      "  SE (Error Estándar)",
+      "────────────────────────────────────────",
+      "MÉTRICAS DE SESGO",
+      "  Bias (Sesgo)",
+      "  Bias relativo"
+    ),
+    Valor = c(
+      n,
+      "",
+      "",
+      mean_obs,
+      sd_obs,
+      min_obs,
+      max_obs,
+      max_obs - min_obs,
+      "",
+      "",
+      mean_pred,
+      sd_pred,
+      min_pred,
+      max_pred,
+      max_pred - min_pred,
+      "",
+      "",
+      r2,
+      r,
+      rmse,
+      rmse_rel,
+      mae,
+      mse,
+      mape,
+      se,
+      "",
+      "",
+      bias,
+      (bias / mean_obs) * 100
+    ),
+    Unidades = c(
+      "observaciones",
+      "",
+      "",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "",
+      "",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "Mg/ha",
+      "",
+      "",
+      "adimensional (0-1)",
+      "adimensional (-1 a 1)",
+      "Mg/ha",
+      "%",
+      "Mg/ha",
+      "(Mg/ha)²",
+      "%",
+      "Mg/ha",
+      "",
+      "",
+      "Mg/ha",
+      "%"
+    )
+  )
+
+  return(tabla)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO SQRT - MÉTRICAS COMPLETAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO SQRT (RAÍZ CUADRADA) - PREDICCIONES CON CORRECCIÓN DE JENSEN\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+tabla_sqrt <- calcular_metricas_completas(agbd.plot.test, pred_sqrt, "SQRT")
+
+# Formatear valores numéricos con manejo de errores
+tabla_sqrt_print <- tabla_sqrt
+for(i in 1:nrow(tabla_sqrt_print)) {
+  valor_actual <- tabla_sqrt_print$Valor[i]
+
+  # Intentar convertir a numérico con manejo de errores
+  valor_numerico <- tryCatch(
+    as.numeric(valor_actual),
+    warning = function(w) NA,
+    error = function(e) NA
+  )
+
+  if(!is.na(valor_numerico) && valor_actual != "") {
+    if(tabla_sqrt_print$Metrica[i] == "Número de observaciones (n)") {
+      tabla_sqrt_print$Valor[i] <- sprintf("%d", valor_numerico)
+    } else if(grepl("R²|r \\(", tabla_sqrt_print$Metrica[i])) {
+      tabla_sqrt_print$Valor[i] <- sprintf("%.4f", valor_numerico)
+    } else if(grepl("%", tabla_sqrt_print$Unidades[i])) {
+      tabla_sqrt_print$Valor[i] <- sprintf("%.2f", valor_numerico)
+    } else if(grepl("Mg/ha", tabla_sqrt_print$Unidades[i])) {
+      tabla_sqrt_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    } else {
+      tabla_sqrt_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    }
+  }
+}
+
+print(tabla_sqrt_print, row.names = FALSE, right = FALSE)
+cat("\n")
+
+# CONFIRMACIÓN EXPLÍCITA: RMSE y MAE en unidades originales
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cat("CONFIRMACIÓN: RMSE y MAE están en UNIDADES ORIGINALES (Mg/ha)\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+rmse_sqrt <- as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  RMSE (Error Cuadrático Medio)"])
+mae_sqrt <- as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  MAE (Error Absoluto Medio)"])
+cat("✓ RMSE (SQRT) = ", sprintf("%.3f", rmse_sqrt), " Mg/ha\n")
+cat("✓ MAE  (SQRT) = ", sprintf("%.3f", mae_sqrt), " Mg/ha\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO LOG - MÉTRICAS COMPLETAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO LOG (LOGARÍTMICO) - PREDICCIONES CON CORRECCIÓN DE JENSEN\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+tabla_log <- calcular_metricas_completas(agbd.plot.test, pred_log, "LOG")
+
+# Formatear valores numéricos con manejo de errores
+tabla_log_print <- tabla_log
+for(i in 1:nrow(tabla_log_print)) {
+  valor_actual <- tabla_log_print$Valor[i]
+
+  valor_numerico <- tryCatch(
+    as.numeric(valor_actual),
+    warning = function(w) NA,
+    error = function(e) NA
+  )
+
+  if(!is.na(valor_numerico) && valor_actual != "") {
+    if(tabla_log_print$Metrica[i] == "Número de observaciones (n)") {
+      tabla_log_print$Valor[i] <- sprintf("%d", valor_numerico)
+    } else if(grepl("R²|r \\(", tabla_log_print$Metrica[i])) {
+      tabla_log_print$Valor[i] <- sprintf("%.4f", valor_numerico)
+    } else if(grepl("%", tabla_log_print$Unidades[i])) {
+      tabla_log_print$Valor[i] <- sprintf("%.2f", valor_numerico)
+    } else if(grepl("Mg/ha", tabla_log_print$Unidades[i])) {
+      tabla_log_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    } else {
+      tabla_log_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    }
+  }
+}
+
+print(tabla_log_print, row.names = FALSE, right = FALSE)
+cat("\n")
+
+# CONFIRMACIÓN EXPLÍCITA: RMSE y MAE en unidades originales
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cat("CONFIRMACIÓN: RMSE y MAE están en UNIDADES ORIGINALES (Mg/ha)\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+rmse_log <- as.numeric(tabla_log$Valor[tabla_log$Metrica == "  RMSE (Error Cuadrático Medio)"])
+mae_log <- as.numeric(tabla_log$Valor[tabla_log$Metrica == "  MAE (Error Absoluto Medio)"])
+cat("✓ RMSE (LOG) = ", sprintf("%.3f", rmse_log), " Mg/ha\n")
+cat("✓ MAE  (LOG) = ", sprintf("%.3f", mae_log), " Mg/ha\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO NONE - MÉTRICAS COMPLETAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO NONE (SIN TRANSFORMACIÓN)\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+tabla_none <- calcular_metricas_completas(agbd.plot.test, pred_none, "NONE")
+
+# Formatear valores numéricos con manejo de errores
+tabla_none_print <- tabla_none
+for(i in 1:nrow(tabla_none_print)) {
+  valor_actual <- tabla_none_print$Valor[i]
+
+  valor_numerico <- tryCatch(
+    as.numeric(valor_actual),
+    warning = function(w) NA,
+    error = function(e) NA
+  )
+
+  if(!is.na(valor_numerico) && valor_actual != "") {
+    if(tabla_none_print$Metrica[i] == "Número de observaciones (n)") {
+      tabla_none_print$Valor[i] <- sprintf("%d", valor_numerico)
+    } else if(grepl("R²|r \\(", tabla_none_print$Metrica[i])) {
+      tabla_none_print$Valor[i] <- sprintf("%.4f", valor_numerico)
+    } else if(grepl("%", tabla_none_print$Unidades[i])) {
+      tabla_none_print$Valor[i] <- sprintf("%.2f", valor_numerico)
+    } else if(grepl("Mg/ha", tabla_none_print$Unidades[i])) {
+      tabla_none_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    } else {
+      tabla_none_print$Valor[i] <- sprintf("%.3f", valor_numerico)
+    }
+  }
+}
+
+print(tabla_none_print, row.names = FALSE, right = FALSE)
+cat("\n")
+
+# CONFIRMACIÓN EXPLÍCITA: RMSE y MAE en unidades originales
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cat("CONFIRMACIÓN: RMSE y MAE están en UNIDADES ORIGINALES (Mg/ha)\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+rmse_none <- as.numeric(tabla_none$Valor[tabla_none$Metrica == "  RMSE (Error Cuadrático Medio)"])
+mae_none <- as.numeric(tabla_none$Valor[tabla_none$Metrica == "  MAE (Error Absoluto Medio)"])
+cat("✓ RMSE (NONE) = ", sprintf("%.3f", rmse_none), " Mg/ha\n")
+cat("✓ MAE  (NONE) = ", sprintf("%.3f", mae_none), " Mg/ha\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLA COMPARATIVA RESUMIDA - LOS 3 MODELOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("COMPARACIÓN RESUMIDA - LOS 3 MODELOS\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Extraer métricas clave
+metricas_clave <- data.frame(
+  Metrica = c("R²", "r (Correlación)", "RMSE (Mg/ha)", "RMSE relativo (%)",
+              "MAE (Mg/ha)", "MAPE (%)", "Bias (Mg/ha)", "Bias relativo (%)"),
+  SQRT = c(
+    sprintf("%.4f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  R² (Coef. Determinación)"])),
+    sprintf("%.4f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  r (Correlación de Pearson)"])),
+    sprintf("%.3f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  RMSE (Error Cuadrático Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  RMSE relativo"])),
+    sprintf("%.3f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  MAE (Error Absoluto Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  MAPE (Error Absoluto % Medio)"])),
+    sprintf("%.3f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  Bias (Sesgo)"])),
+    sprintf("%.2f", as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  Bias relativo"]))
+  ),
+  LOG = c(
+    sprintf("%.4f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  R² (Coef. Determinación)"])),
+    sprintf("%.4f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  r (Correlación de Pearson)"])),
+    sprintf("%.3f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  RMSE (Error Cuadrático Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  RMSE relativo"])),
+    sprintf("%.3f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  MAE (Error Absoluto Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  MAPE (Error Absoluto % Medio)"])),
+    sprintf("%.3f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  Bias (Sesgo)"])),
+    sprintf("%.2f", as.numeric(tabla_log$Valor[tabla_log$Metrica == "  Bias relativo"]))
+  ),
+  NONE = c(
+    sprintf("%.4f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  R² (Coef. Determinación)"])),
+    sprintf("%.4f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  r (Correlación de Pearson)"])),
+    sprintf("%.3f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  RMSE (Error Cuadrático Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  RMSE relativo"])),
+    sprintf("%.3f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  MAE (Error Absoluto Medio)"])),
+    sprintf("%.2f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  MAPE (Error Absoluto % Medio)"])),
+    sprintf("%.3f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  Bias (Sesgo)"])),
+    sprintf("%.2f", as.numeric(tabla_none$Valor[tabla_none$Metrica == "  Bias relativo"]))
+  )
+)
+
+print(metricas_clave, row.names = FALSE, right = FALSE)
+cat("\n")
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("RESUMEN EJECUTIVO: RMSE Y MAE EN UNIDADES ORIGINALES (Mg/ha)\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+resumen_errores <- data.frame(
+  Modelo = c("SQRT", "LOG", "NONE"),
+  `RMSE (Mg/ha)` = c(rmse_sqrt, rmse_log, rmse_none),
+  `MAE (Mg/ha)` = c(mae_sqrt, mae_log, mae_none),
+  check.names = FALSE
+)
+
+print(resumen_errores, row.names = FALSE)
+cat("\n")
+cat("✓ Todas las métricas calculadas en ESCALA ORIGINAL (Mg/ha)\n")
+cat("✓ RMSE: Error Cuadrático Medio - penaliza errores grandes\n")
+cat("✓ MAE:  Error Absoluto Medio - más robusto a valores extremos\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IDENTIFICAR MEJOR MODELO POR CADA CRITERIO
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MEJOR MODELO POR CRITERIO\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Extraer valores numéricos para comparación
+r2_vals <- c(SQRT = as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  R² (Coef. Determinación)"]),
+             LOG = as.numeric(tabla_log$Valor[tabla_log$Metrica == "  R² (Coef. Determinación)"]),
+             NONE = as.numeric(tabla_none$Valor[tabla_none$Metrica == "  R² (Coef. Determinación)"]))
+
+rmse_vals <- c(SQRT = as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  RMSE (Error Cuadrático Medio)"]),
+               LOG = as.numeric(tabla_log$Valor[tabla_log$Metrica == "  RMSE (Error Cuadrático Medio)"]),
+               NONE = as.numeric(tabla_none$Valor[tabla_none$Metrica == "  RMSE (Error Cuadrático Medio)"]))
+
+mae_vals <- c(SQRT = as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  MAE (Error Absoluto Medio)"]),
+              LOG = as.numeric(tabla_log$Valor[tabla_log$Metrica == "  MAE (Error Absoluto Medio)"]),
+              NONE = as.numeric(tabla_none$Valor[tabla_none$Metrica == "  MAE (Error Absoluto Medio)"]))
+
+bias_vals <- c(SQRT = as.numeric(tabla_sqrt$Valor[tabla_sqrt$Metrica == "  Bias (Sesgo)"]),
+               LOG = as.numeric(tabla_log$Valor[tabla_log$Metrica == "  Bias (Sesgo)"]),
+               NONE = as.numeric(tabla_none$Valor[tabla_none$Metrica == "  Bias (Sesgo)"]))
+
+cat("🏆 Mejor R² (mayor):           ", names(which.max(r2_vals)),
+    " (R² = ", sprintf("%.4f", max(r2_vals)), ")\n", sep="")
+cat("🏆 Mejor RMSE (menor):         ", names(which.min(rmse_vals)),
+    " (RMSE = ", sprintf("%.3f", min(rmse_vals)), " Mg/ha)\n", sep="")
+cat("🏆 Mejor MAE (menor):          ", names(which.min(mae_vals)),
+    " (MAE = ", sprintf("%.3f", min(mae_vals)), " Mg/ha)\n", sep="")
+cat("🏆 Mejor Bias (más cercano a 0):", names(which.min(abs(bias_vals))),
+    " (Bias = ", sprintf("%.3f", bias_vals[which.min(abs(bias_vals))]), " Mg/ha)\n", sep="")
+
+cat("\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Guardar para uso posterior (mantener compatibilidad con código existente)
+metricas_validacion <- data.frame(
+  Modelo = c("SQRT", "LOG", "NONE"),
+  R2 = r2_vals,
+  RMSE = rmse_vals,
+  MAE = mae_vals,
+  Bias = bias_vals,
+  row.names = NULL
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# COMPARACIÓN: MÉTRICAS CON Y SIN CORRECCIÓN DE SESGO
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("IMPACTO DE LA CORRECCIÓN DE SESGO DE JENSEN EN LAS MÉTRICAS\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Función simplificada para calcular métricas básicas
+calcular_metricas <- function(obs, pred) {
+  rmse <- sqrt(mean((obs - pred)^2, na.rm = TRUE))
+  mae <- mean(abs(obs - pred), na.rm = TRUE)
+  r2 <- cor(obs, pred, use = "complete.obs")^2
+  bias <- mean(pred - obs, na.rm = TRUE)
+  return(c(RMSE = rmse, MAE = mae, R2 = r2, Bias = bias))
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODELO SQRT: COMPARACIÓN CON Y SIN CORRECCIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO SQRT - IMPACTO DE LA CORRECCIÓN DE JENSEN\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Métricas sin corrección
+metricas_sqrt_sin <- calcular_metricas(agbd.plot.test, pred_sqrt_original)
+
+# Métricas con corrección
+metricas_sqrt_con <- calcular_metricas(agbd.plot.test, pred_sqrt_corregido)
+
+# Crear tabla comparativa
+tabla_comp_sqrt <- data.frame(
+  Metrica = c(
+    "R² (Coeficiente de Determinación)",
+    "RMSE (Error Cuadrático Medio)",
+    "MAE (Error Absoluto Medio)",
+    "Bias (Sesgo)",
+    "────────────────────────────────────",
+    "CAMBIOS (Δ) por corrección Jensen"
+  ),
+  Sin_Correccion = c(
+    sprintf("%.4f", metricas_sqrt_sin["R2"]),
+    sprintf("%.3f", metricas_sqrt_sin["RMSE"]),
+    sprintf("%.3f", metricas_sqrt_sin["MAE"]),
+    sprintf("%.3f", metricas_sqrt_sin["Bias"]),
+    "",
+    ""
+  ),
+  Con_Correccion = c(
+    sprintf("%.4f", metricas_sqrt_con["R2"]),
+    sprintf("%.3f", metricas_sqrt_con["RMSE"]),
+    sprintf("%.3f", metricas_sqrt_con["MAE"]),
+    sprintf("%.3f", metricas_sqrt_con["Bias"]),
+    "",
+    ""
+  ),
+  Delta = c(
+    sprintf("%+.4f", metricas_sqrt_con["R2"] - metricas_sqrt_sin["R2"]),
+    sprintf("%+.3f", metricas_sqrt_con["RMSE"] - metricas_sqrt_sin["RMSE"]),
+    sprintf("%+.3f", metricas_sqrt_con["MAE"] - metricas_sqrt_sin["MAE"]),
+    sprintf("%+.3f", metricas_sqrt_con["Bias"] - metricas_sqrt_sin["Bias"]),
+    "",
+    ""
+  ),
+  Unidades = c(
+    "adimensional",
+    "Mg/ha",
+    "Mg/ha",
+    "Mg/ha",
+    "",
+    ""
+  )
+)
+
+colnames(tabla_comp_sqrt) <- c("Métrica", "Sin Corrección", "Con Corrección Jensen", "Δ (Cambio)", "Unidades")
+print(tabla_comp_sqrt, row.names = FALSE, right = FALSE)
+
+cat("\n")
+delta_r2_sqrt <- metricas_sqrt_con["R2"] - metricas_sqrt_sin["R2"]
+delta_rmse_sqrt <- metricas_sqrt_con["RMSE"] - metricas_sqrt_sin["RMSE"]
+delta_bias_sqrt <- metricas_sqrt_con["Bias"] - metricas_sqrt_sin["Bias"]
+
+cat("Interpretación de cambios:\n")
+cat("  • Δ R²:   ", sprintf("%+.4f", delta_r2_sqrt),
+    ifelse(delta_r2_sqrt > 0, "✓ Mejora", "✗ Empeora"), "\n")
+cat("  • Δ RMSE: ", sprintf("%+.3f", delta_rmse_sqrt), "Mg/ha",
+    ifelse(delta_rmse_sqrt < 0, "✓ Mejora (menor error)", "⚠ Mayor error"), "\n")
+cat("  • Δ Bias: ", sprintf("%+.3f", delta_bias_sqrt), "Mg/ha",
+    ifelse(abs(metricas_sqrt_con["Bias"]) < abs(metricas_sqrt_sin["Bias"]),
+           "✓ Mejora (más cerca de 0)", "✗ Empeora (más lejos de 0)"), "\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODELO LOG: COMPARACIÓN CON Y SIN CORRECCIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO LOG - IMPACTO DE LA CORRECCIÓN DE JENSEN\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Métricas sin corrección
+metricas_log_sin <- calcular_metricas(agbd.plot.test, pred_log_original)
+
+# Métricas con corrección
+metricas_log_con <- calcular_metricas(agbd.plot.test, pred_log_corregido)
+
+# Crear tabla comparativa
+tabla_comp_log <- data.frame(
+  Metrica = c(
+    "R² (Coeficiente de Determinación)",
+    "RMSE (Error Cuadrático Medio)",
+    "MAE (Error Absoluto Medio)",
+    "Bias (Sesgo)",
+    "────────────────────────────────────",
+    "CAMBIOS (Δ) por corrección Jensen"
+  ),
+  Sin_Correccion = c(
+    sprintf("%.4f", metricas_log_sin["R2"]),
+    sprintf("%.3f", metricas_log_sin["RMSE"]),
+    sprintf("%.3f", metricas_log_sin["MAE"]),
+    sprintf("%.3f", metricas_log_sin["Bias"]),
+    "",
+    ""
+  ),
+  Con_Correccion = c(
+    sprintf("%.4f", metricas_log_con["R2"]),
+    sprintf("%.3f", metricas_log_con["RMSE"]),
+    sprintf("%.3f", metricas_log_con["MAE"]),
+    sprintf("%.3f", metricas_log_con["Bias"]),
+    "",
+    ""
+  ),
+  Delta = c(
+    sprintf("%+.4f", metricas_log_con["R2"] - metricas_log_sin["R2"]),
+    sprintf("%+.3f", metricas_log_con["RMSE"] - metricas_log_sin["RMSE"]),
+    sprintf("%+.3f", metricas_log_con["MAE"] - metricas_log_sin["MAE"]),
+    sprintf("%+.3f", metricas_log_con["Bias"] - metricas_log_sin["Bias"]),
+    "",
+    ""
+  ),
+  Unidades = c(
+    "adimensional",
+    "Mg/ha",
+    "Mg/ha",
+    "Mg/ha",
+    "",
+    ""
+  )
+)
+
+colnames(tabla_comp_log) <- c("Métrica", "Sin Corrección", "Con Corrección Jensen", "Δ (Cambio)", "Unidades")
+print(tabla_comp_log, row.names = FALSE, right = FALSE)
+
+cat("\n")
+delta_r2_log <- metricas_log_con["R2"] - metricas_log_sin["R2"]
+delta_rmse_log <- metricas_log_con["RMSE"] - metricas_log_sin["RMSE"]
+delta_bias_log <- metricas_log_con["Bias"] - metricas_log_sin["Bias"]
+
+cat("Interpretación de cambios:\n")
+cat("  • Δ R²:   ", sprintf("%+.4f", delta_r2_log),
+    ifelse(delta_r2_log > 0, "✓ Mejora", "✗ Empeora"), "\n")
+cat("  • Δ RMSE: ", sprintf("%+.3f", delta_rmse_log), "Mg/ha",
+    ifelse(delta_rmse_log < 0, "✓ Mejora (menor error)", "⚠ Mayor error"), "\n")
+cat("  • Δ Bias: ", sprintf("%+.3f", delta_bias_log), "Mg/ha",
+    ifelse(abs(metricas_log_con["Bias"]) < abs(metricas_log_sin["Bias"]),
+           "✓ Mejora (más cerca de 0)", "✗ Empeora (más lejos de 0)"), "\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("INTERPRETACIÓN:\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+cat("La corrección de sesgo de Jensen:\n")
+cat("  ✓ Es teóricamente correcta para obtener estimaciones insesgadas\n")
+cat("  ✓ Corrige el sesgo sistemático introducido por la retransformación\n")
+cat("  • Puede aumentar ligeramente el RMSE (trade-off sesgo vs varianza)\n")
+cat("  • Debería reducir el sesgo (Bias) acercándolo a 0\n\n")
+
+cat("RECOMENDACIÓN: Use las predicciones CON corrección de Jensen para\n")
+cat("reportar resultados finales, ya que son estadísticamente insesgadas.\n\n")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICO: OBSERVADO VS PREDICHO
+# ══════════════════════════════════════════════════════════════════════════════
+
+datos_validacion <- data.frame(
+  Observado = rep(agbd.plot.test, 2),
+  Predicho = c(pred_sqrt, pred_log),
+  Modelo = rep(c("SQRT", "LOG"), each = length(agbd.plot.test))
+)
+
+ggplot(datos_validacion, aes(x = Observado, y = Predicho, color = Modelo)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "black", linewidth = 1) +
+  scale_color_manual(values = c("SQRT" = "#3498db", "LOG" = "#e74c3c")) +
+  facet_wrap(~ Modelo, ncol = 2) +
+  labs(
+    title = "Validación: Biomasa Observada vs Predicha",
+    subtitle = "Conjunto de prueba (10% de datos)",
+    x = "Biomasa Observada (Mg/ha)",
+    y = "Biomasa Predicha (Mg/ha)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+```
+
+---
+
+## RESUMEN: FÓRMULAS DE TRANSFORMACIÓN Y RETRANSFORMACIÓN
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCUMENTACIÓN COMPLETA DE LAS TRANSFORMACIONES
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                 RESUMEN DE TRANSFORMACIONES APLICADAS                        ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO 1: RAÍZ CUADRADA (SQRT)\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("1. TRANSFORMACIÓN (para ajuste del modelo):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Y_transformado = √(Biomasa_original)\n\n")
+cat("   Código R:\n")
+cat("   agbd.plot_sqrt <- sqrt(agbd.plot)\n\n")
+
+cat("2. MODELO AJUSTADO (en escala transformada):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   √Biomasa(s) = [α + α̃(s)] + [β + β̃(s)]·CCI(s) + [η + η̃(s)]·GEDI(s) + ε(s)\n\n")
+
+cat("3. RETRANSFORMACIÓN SIN CORRECCIÓN:\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa_pred = (√Biomasa_pred)²\n\n")
+cat("   Código R:\n")
+cat("   pred_sqrt_original <- pred_sqrt_trans^2\n\n")
+
+cat("4. RETRANSFORMACIÓN CON CORRECCIÓN DE JENSEN:\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa_pred = (√Biomasa_pred)² + σ²\n\n")
+cat("   Donde σ² es la varianza del error del modelo\n\n")
+cat("   Código R:\n")
+cat("   sigma2_sqrt <- 1 / model_fit$summary.hyperpar['Precision...', 'mean']\n")
+cat("   pred_sqrt_corregido <- pred_sqrt_trans^2 + sigma2_sqrt\n\n")
+
+cat("   Justificación matemática:\n")
+cat("   E[Y²] = (E[Y])² + Var[Y]    (propiedad de la varianza)\n")
+cat("   Por lo tanto, para obtener E[Y²] necesitamos sumar Var[Y]\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO 2: LOGARITMO NATURAL (LOG)\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("1. TRANSFORMACIÓN (para ajuste del modelo):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Y_transformado = log(1 + Biomasa_original)\n\n")
+cat("   Nota: Se usa log1p (log(1+x)) para evitar log(0) = -∞\n\n")
+cat("   Código R:\n")
+cat("   agbd.plot_log <- log1p(agbd.plot)\n\n")
+
+cat("2. MODELO AJUSTADO (en escala transformada):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   log(1+Biomasa(s)) = [α + α̃(s)] + [β + β̃(s)]·CCI(s) + [η + η̃(s)]·GEDI(s) + ε(s)\n\n")
+
+cat("3. RETRANSFORMACIÓN SIN CORRECCIÓN:\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa_pred = exp(log_pred) - 1\n\n")
+cat("   Código R:\n")
+cat("   pred_log_original <- expm1(pred_log_trans)  # expm1(x) = exp(x) - 1\n\n")
+
+cat("4. RETRANSFORMACIÓN CON CORRECCIÓN DE JENSEN:\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa_pred = exp(log_pred + σ²/2) - 1\n\n")
+cat("   Donde σ² es la varianza del error del modelo\n\n")
+cat("   Código R:\n")
+cat("   sigma2_log <- 1 / model_log$summary.hyperpar['Precision...', 'mean']\n")
+cat("   pred_log_corregido <- expm1(pred_log_trans + sigma2_log/2)\n\n")
+
+cat("   Justificación matemática:\n")
+cat("   E[exp(Y)] = exp(E[Y] + Var[Y]/2)    (para Y ~ Normal)\n")
+cat("   Esta es la corrección estándar para transformación log-normal\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("MODELO 3: SIN TRANSFORMACIÓN (NONE)\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("1. MODELO AJUSTADO (escala original):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa(s) = [α + α̃(s)] + [β + β̃(s)]·CCI(s) + [η + η̃(s)]·GEDI(s) + ε(s)\n\n")
+
+cat("2. PREDICCIÓN (sin necesidad de retransformación):\n")
+cat("   ───────────────────────────────────────────\n")
+cat("   Biomasa_pred = predicción del modelo directamente\n\n")
+cat("   No requiere corrección de sesgo porque no hay transformación\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("¿POR QUÉ ES IMPORTANTE LA CORRECCIÓN DE JENSEN?\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("La DESIGUALDAD DE JENSEN establece que para funciones convexas/cóncavas:\n\n")
+cat("   E[g(Y)] ≠ g(E[Y])\n\n")
+
+cat("Esto significa que:\n")
+cat("   • Si transformamos Y → g(Y), ajustamos el modelo, y luego retransformamos\n")
+cat("   • La retransformación simple g⁻¹(E[Y_trans]) NO da E[Y_original]\n")
+cat("   • Se introduce un SESGO SISTEMÁTICO\n\n")
+
+cat("Ejemplos concretos:\n")
+cat("   • SQRT: (E[√Y])² < E[Y]     (subestimación)\n")
+cat("   • LOG:  exp(E[log Y]) < E[Y] (subestimación)\n\n")
+
+cat("La corrección de Jensen compensa este sesgo usando la varianza:\n")
+cat("   • SQRT: E[Y] = (E[√Y])² + Var[√Y]\n")
+cat("   • LOG:  E[Y] = exp(E[log Y] + Var[log Y]/2)\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("VALORES CALCULADOS EN ESTE ANÁLISIS\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("Varianzas del error (σ²):\n")
+cat("   • Modelo SQRT: σ² =", round(sigma2_sqrt, 6), "\n")
+cat("   • Modelo LOG:  σ² =", round(sigma2_log, 6), "\n\n")
+
+cat("Magnitud promedio de la corrección:\n")
+cat("   • Modelo SQRT:", round(mean(pred_sqrt_corregido - pred_sqrt_original), 4), "Mg/ha\n")
+cat("   • Modelo LOG: ", round(mean(pred_log_corregido - pred_log_original), 4), "Mg/ha\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n")
+cat("RECOMENDACIONES PARA REPORTAR RESULTADOS\n")
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+
+cat("✓ SIEMPRE use predicciones con corrección de Jensen para:\n")
+cat("   • Reportar estimaciones de biomasa\n")
+cat("   • Calcular totales o promedios\n")
+cat("   • Comparar con otros estudios\n")
+cat("   • Publicar mapas de biomasa\n\n")
+
+cat("✓ DOCUMENTE claramente en su metodología:\n")
+cat("   • Qué transformación se usó\n")
+cat("   • Que aplicó corrección de sesgo de Jensen\n")
+cat("   • La fórmula específica de corrección\n\n")
+
+cat("✓ REPORTE en resultados:\n")
+cat("   • La varianza del error (σ²) estimada\n")
+cat("   • La magnitud promedio de la corrección\n")
+cat("   • Comparación de métricas con/sin corrección (tabla)\n\n")
+
+cat("════════════════════════════════════════════════════════════════════════════════\n\n")
+```
+
+---
+
+## TEST DE KOLMOGOROV-SMIRNOV (K-S) PARA EVALUACIÓN DEL MODELO
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# TEST DE KOLMOGOROV-SMIRNOV PARA EVALUAR LA BONDAD DE AJUSTE
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║           TEST DE KOLMOGOROV-SMIRNOV (K-S) - BONDAD DE AJUSTE               ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 1. CÁLCULO DE RESIDUALES PARA CADA MODELO
+# ──────────────────────────────────────────────────────────────────────────────
+
+residuales_sqrt <- agbd.plot.test - pred_sqrt
+residuales_log <- agbd.plot.test - pred_log
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2. TEST K-S PARA NORMALIDAD DE RESIDUALES
+# ──────────────────────────────────────────────────────────────────────────────
+# Hipótesis nula (H0): Los residuales siguen una distribución normal
+# Si p-value > 0.05: No rechazamos H0 → Los residuales son aproximadamente normales
+# Si p-value < 0.05: Rechazamos H0 → Los residuales NO son normales
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("TEST K-S: NORMALIDAD DE RESIDUALES\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Test K-S para modelo SQRT
+ks_residuales_sqrt <- ks.test(residuales_sqrt, "pnorm",
+                                mean = mean(residuales_sqrt, na.rm = TRUE),
+                                sd = sd(residuales_sqrt, na.rm = TRUE))
+
+cat("MODELO SQRT:\n")
+cat("  Estadístico D:", round(ks_residuales_sqrt$statistic, 4), "\n")
+cat("  p-value:", format.pval(ks_residuales_sqrt$p.value, digits = 4), "\n")
+cat("  Interpretación:", ifelse(ks_residuales_sqrt$p.value > 0.05,
+                                 "✓ Residuales aproximadamente normales (p > 0.05)",
+                                 "✗ Residuales NO normales (p < 0.05)"), "\n\n")
+
+# Test K-S para modelo LOG
+ks_residuales_log <- ks.test(residuales_log, "pnorm",
+                               mean = mean(residuales_log, na.rm = TRUE),
+                               sd = sd(residuales_log, na.rm = TRUE))
+
+cat("MODELO LOG:\n")
+cat("  Estadístico D:", round(ks_residuales_log$statistic, 4), "\n")
+cat("  p-value:", format.pval(ks_residuales_log$p.value, digits = 4), "\n")
+cat("  Interpretación:", ifelse(ks_residuales_log$p.value > 0.05,
+                                 "✓ Residuales aproximadamente normales (p > 0.05)",
+                                 "✗ Residuales NO normales (p < 0.05)"), "\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. TEST K-S DE DOS MUESTRAS: PREDICCIONES VS OBSERVACIONES
+# ──────────────────────────────────────────────────────────────────────────────
+# Compara las distribuciones empíricas de predicciones y observaciones
+# H0: Ambas muestras provienen de la misma distribución
+# p-value > 0.05: Las distribuciones son similares (buen ajuste)
+# p-value < 0.05: Las distribuciones son diferentes (mal ajuste)
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("TEST K-S DE DOS MUESTRAS: PREDICCIONES VS OBSERVACIONES\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Test para modelo SQRT
+ks_pred_sqrt <- ks.test(pred_sqrt, agbd.plot.test)
+cat("MODELO SQRT:\n")
+cat("  Estadístico D:", round(ks_pred_sqrt$statistic, 4), "\n")
+cat("  p-value:", format.pval(ks_pred_sqrt$p.value, digits = 4), "\n")
+cat("  Interpretación:", ifelse(ks_pred_sqrt$p.value > 0.05,
+                                 "✓ Distribuciones similares (buen ajuste)",
+                                 "✗ Distribuciones diferentes"), "\n\n")
+
+# Test para modelo LOG
+ks_pred_log <- ks.test(pred_log, agbd.plot.test)
+cat("MODELO LOG:\n")
+cat("  Estadístico D:", round(ks_pred_log$statistic, 4), "\n")
+cat("  p-value:", format.pval(ks_pred_log$p.value, digits = 4), "\n")
+cat("  Interpretación:", ifelse(ks_pred_log$p.value > 0.05,
+                                 "✓ Distribuciones similares (buen ajuste)",
+                                 "✗ Distribuciones diferentes"), "\n\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4. TABLA RESUMEN DE RESULTADOS K-S
+# ──────────────────────────────────────────────────────────────────────────────
+
+resultados_ks <- data.frame(
+  Modelo = c("SQRT", "LOG"),
+  KS_Residuales_D = c(ks_residuales_sqrt$statistic,
+                       ks_residuales_log$statistic),
+  KS_Residuales_p = c(ks_residuales_sqrt$p.value,
+                       ks_residuales_log$p.value),
+  KS_Pred_vs_Obs_D = c(ks_pred_sqrt$statistic,
+                        ks_pred_log$statistic),
+  KS_Pred_vs_Obs_p = c(ks_pred_sqrt$p.value,
+                        ks_pred_log$p.value),
+  Normalidad_OK = c(ks_residuales_sqrt$p.value > 0.05,
+                     ks_residuales_log$p.value > 0.05),
+  Ajuste_OK = c(ks_pred_sqrt$p.value > 0.05,
+                 ks_pred_log$p.value > 0.05)
+)
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("TABLA RESUMEN: RESULTADOS DEL TEST DE KOLMOGOROV-SMIRNOV\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Crear tabla con columnas numéricas redondeadas
+tabla_ks <- resultados_ks[, 1:5]
+tabla_ks[, 2:5] <- round(tabla_ks[, 2:5], 4)
+print(tabla_ks, row.names = FALSE)
+cat("\n")
+
+# Mejor modelo según test K-S
+cat("EVALUACIÓN SEGÚN TEST K-S:\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+for(i in 1:nrow(resultados_ks)) {
+  cat(resultados_ks$Modelo[i], ":\n")
+  cat("  • Normalidad de residuales:",
+      ifelse(resultados_ks$Normalidad_OK[i], "✓ PASA", "✗ NO PASA"), "\n")
+  cat("  • Ajuste Pred vs Obs:",
+      ifelse(resultados_ks$Ajuste_OK[i], "✓ PASA", "✗ NO PASA"), "\n\n")
+}
+```
+
+---
+
+## VISUALIZACIÓN DE RESIDUALES Y DIAGNÓSTICO
+
+```{r, fig.width=12, fig.height=10}
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICOS DE DIAGNÓSTICO: HISTOGRAMAS Y Q-Q PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Preparar datos para visualización
+datos_residuales <- data.frame(
+  Residual = c(residuales_sqrt, residuales_log),
+  Modelo = rep(c("SQRT", "LOG"), each = length(residuales_sqrt))
+)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HISTOGRAMAS DE RESIDUALES CON CURVA NORMAL
+# ──────────────────────────────────────────────────────────────────────────────
+
+p_hist <- ggplot(datos_residuales, aes(x = Residual, fill = Modelo)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, alpha = 0.7, color = "black") +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  stat_function(fun = dnorm,
+                args = list(mean = 0, sd = sd(datos_residuales$Residual[datos_residuales$Modelo == "SQRT"])),
+                aes(color = "Normal teórica"),
+                linewidth = 1, linetype = "dashed") +
+  facet_wrap(~ Modelo, scales = "free", ncol = 2) +
+  scale_fill_manual(values = c("SQRT" = "#3498db", "LOG" = "#e74c3c")) +
+  scale_color_manual(values = c("Normal teórica" = "black")) +
+  labs(
+    title = "Distribución de Residuales por Modelo",
+    subtitle = "Comparación con distribución normal teórica",
+    x = "Residual (Mg/ha)",
+    y = "Densidad",
+    color = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+print(p_hist)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Q-Q PLOTS (Quantile-Quantile)
+# ──────────────────────────────────────────────────────────────────────────────
+
+p_qq <- ggplot(datos_residuales, aes(sample = Residual, color = Modelo)) +
+  stat_qq() +
+  stat_qq_line(linewidth = 1) +
+  facet_wrap(~ Modelo, scales = "free", ncol = 2) +
+  scale_color_manual(values = c("SQRT" = "#3498db", "LOG" = "#e74c3c")) +
+  labs(
+    title = "Q-Q Plot: Evaluación de Normalidad de Residuales",
+    subtitle = "Los puntos deben seguir la línea diagonal si los residuales son normales",
+    x = "Cuantiles Teóricos (Distribución Normal)",
+    y = "Cuantiles Observados (Residuales)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+print(p_qq)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GRÁFICO DE RESIDUALES VS VALORES PREDICHOS
+# ──────────────────────────────────────────────────────────────────────────────
+
+datos_residuales_pred <- data.frame(
+  Predicho = c(pred_sqrt, pred_log),
+  Residual = c(residuales_sqrt, residuales_log),
+  Modelo = rep(c("SQRT", "LOG"), each = length(residuales_sqrt))
+)
+
+p_res_vs_pred <- ggplot(datos_residuales_pred, aes(x = Predicho, y = Residual, color = Modelo)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 1) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.2, linewidth = 1) +
+  facet_wrap(~ Modelo, scales = "free_x", ncol = 2) +
+  scale_color_manual(values = c("SQRT" = "#3498db", "LOG" = "#e74c3c")) +
+  labs(
+    title = "Residuales vs Valores Predichos",
+    subtitle = "Verificación de homocedasticidad (varianza constante)",
+    x = "Biomasa Predicha (Mg/ha)",
+    y = "Residual (Mg/ha)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+print(p_res_vs_pred)
+```
+
+---
+
+## FUNCIONES DE DISTRIBUCIÓN ACUMULADA (ECDF)
+
+```{r, fig.width=12, fig.height=5}
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICO DE FUNCIONES DE DISTRIBUCIÓN ACUMULADA EMPÍRICA
+# ══════════════════════════════════════════════════════════════════════════════
+# Visualiza la comparación que hace el test K-S
+
+datos_ecdf <- data.frame(
+  Valor = c(agbd.plot.test, pred_sqrt, pred_log),
+  Tipo = rep(c("Observado", "SQRT", "LOG"),
+             each = length(agbd.plot.test)),
+  Modelo = rep(c("Observado", "SQRT", "LOG"),
+               each = length(agbd.plot.test))
+)
+
+p_ecdf <- ggplot(datos_ecdf, aes(x = Valor, color = Tipo)) +
+  stat_ecdf(linewidth = 1.2, alpha = 0.8) +
+  scale_color_manual(values = c("Observado" = "black",
+                                 "SQRT" = "#3498db",
+                                 "LOG" = "#e74c3c")) +
+  labs(
+    title = "Funciones de Distribución Acumulada Empírica (ECDF)",
+    subtitle = "Comparación visual del Test K-S: cuanto más cercanas las curvas, mejor el ajuste",
+    x = "Biomasa (Mg/ha)",
+    y = "Probabilidad Acumulada",
+    color = "Tipo"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold")
+  )
+
+print(p_ecdf)
+```
+
+---
+
+## COMPARACIÓN INTEGRAL: MÉTRICAS DE PRECISIÓN + TEST K-S
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLA COMPARATIVA COMPLETA: TODAS LAS MÉTRICAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                  COMPARACIÓN INTEGRAL DE MODELOS                             ║\n")
+cat("║          Métricas de Precisión + Test de Kolmogorov-Smirnov                 ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+# Combinar métricas de validación con resultados K-S
+comparacion_completa <- metricas_validacion %>%
+  left_join(resultados_ks, by = "Modelo") %>%
+  select(Modelo, R2, RMSE, MAE, Bias,
+         KS_Residuales_p, KS_Pred_vs_Obs_p,
+         Normalidad_OK, Ajuste_OK)
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("TABLA COMPARATIVA COMPLETA\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Preparar tabla para imprimir
+tabla_comparacion <- comparacion_completa
+tabla_comparacion[, 2:7] <- round(tabla_comparacion[, 2:7], 4)
+print(tabla_comparacion, row.names = FALSE)
+cat("\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ANÁLISIS DETALLADO POR CRITERIO
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("EVALUACIÓN POR CRITERIOS\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# 1. PRECISIÓN (R²)
+cat("1️⃣  COEFICIENTE DE DETERMINACIÓN (R²)\n")
+cat("   Mide qué % de la variabilidad es explicada por el modelo\n")
+cat("   Interpretación: Mayor R² = Mejor ajuste\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_r2_idx <- which.max(comparacion_completa$R2)
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_r2_idx) "🏆" else "  "
+  cat(sprintf("   %s %s: R² = %.4f", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$R2[i]))
+  if(i == mejor_r2_idx) cat(" ← MEJOR")
+  cat("\n")
+}
+cat("\n")
+
+# 2. ERROR (RMSE)
+cat("2️⃣  ERROR CUADRÁTICO MEDIO (RMSE)\n")
+cat("   Mide el error promedio de las predicciones en Mg/ha\n")
+cat("   Interpretación: Menor RMSE = Mejor predicción\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_rmse_idx <- which.min(comparacion_completa$RMSE)
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_rmse_idx) "🏆" else "  "
+  cat(sprintf("   %s %s: RMSE = %.4f Mg/ha", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$RMSE[i]))
+  if(i == mejor_rmse_idx) cat(" ← MEJOR")
+  cat("\n")
+}
+cat("\n")
+
+# 3. ERROR ABSOLUTO (MAE)
+cat("3️⃣  ERROR ABSOLUTO MEDIO (MAE)\n")
+cat("   Mide el error absoluto promedio en Mg/ha\n")
+cat("   Interpretación: Menor MAE = Menor error promedio\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_mae_idx <- which.min(comparacion_completa$MAE)
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_mae_idx) "🏆" else "  "
+  cat(sprintf("   %s %s: MAE = %.4f Mg/ha", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$MAE[i]))
+  if(i == mejor_mae_idx) cat(" ← MEJOR")
+  cat("\n")
+}
+cat("\n")
+
+# 4. SESGO (BIAS)
+cat("4️⃣  SESGO (BIAS)\n")
+cat("   Mide si el modelo sobreestima (+) o subestima (-) en promedio\n")
+cat("   Interpretación: Más cercano a 0 = Mejor (sin sesgo)\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_bias_idx <- which.min(abs(comparacion_completa$Bias))
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_bias_idx) "🏆" else "  "
+  tendencia <- if(comparacion_completa$Bias[i] > 0) "SOBREESTIMA" else "SUBESTIMA"
+  cat(sprintf("   %s %s: Bias = %.4f Mg/ha (%s)", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$Bias[i],
+              tendencia))
+  if(i == mejor_bias_idx) cat(" ← MEJOR")
+  cat("\n")
+}
+cat("\n")
+
+# 5. NORMALIDAD DE RESIDUALES
+cat("5️⃣  NORMALIDAD DE RESIDUALES (Test K-S)\n")
+cat("   Evalúa si los errores del modelo están distribuidos normalmente\n")
+cat("   Interpretación: p-value > 0.05 = Residuales normales ✓\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_norm_idx <- which.max(comparacion_completa$KS_Residuales_p)
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_norm_idx) "🏆" else "  "
+  resultado <- if(comparacion_completa$Normalidad_OK[i]) "✓ PASA" else "✗ NO PASA"
+  cat(sprintf("   %s %s: p-value = %.4f %s", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$KS_Residuales_p[i],
+              resultado))
+  if(i == mejor_norm_idx) cat(" ← MEJOR")
+  cat("\n")
+}
+cat("\n")
+
+# 6. BONDAD DE AJUSTE
+cat("6️⃣  BONDAD DE AJUSTE (Test K-S: Predicciones vs Observaciones)\n")
+cat("   Evalúa si las predicciones tienen distribución similar a los datos reales\n")
+cat("   Interpretación: p-value > 0.05 = Buen ajuste ✓\n")
+cat("   ────────────────────────────────────────────────────────────────────────\n")
+mejor_ajuste_idx <- which.max(comparacion_completa$KS_Pred_vs_Obs_p)
+for(i in 1:nrow(comparacion_completa)) {
+  simbolo <- if(i == mejor_ajuste_idx) "🏆" else "  "
+  resultado <- if(comparacion_completa$Ajuste_OK[i]) "✓ PASA" else "✗ NO PASA"
+  cat(sprintf("   %s %s: p-value = %.4f %s", simbolo,
+              comparacion_completa$Modelo[i],
+              comparacion_completa$KS_Pred_vs_Obs_p[i],
+              resultado))
+  if(i == mejor_ajuste_idx) cat(" ← MEJOR (empate)")
+  cat("\n")
+}
+cat("\n")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# RESUMEN Y RECOMENDACIÓN FINAL
+# ──────────────────────────────────────────────────────────────────────────────
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("📊 RESUMEN DE RESULTADOS\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Contar victorias por modelo
+victorias <- data.frame(
+  Modelo = comparacion_completa$Modelo,
+  R2_mejor = comparacion_completa$R2 == max(comparacion_completa$R2),
+  RMSE_mejor = comparacion_completa$RMSE == min(comparacion_completa$RMSE),
+  MAE_mejor = comparacion_completa$MAE == min(comparacion_completa$MAE),
+  Bias_mejor = abs(comparacion_completa$Bias) == min(abs(comparacion_completa$Bias)),
+  Normalidad_mejor = comparacion_completa$KS_Residuales_p == max(comparacion_completa$KS_Residuales_p),
+  Ajuste_mejor = comparacion_completa$KS_Pred_vs_Obs_p == max(comparacion_completa$KS_Pred_vs_Obs_p)
+)
+
+victorias$Total_victorias <- rowSums(victorias[, -1])
+
+cat("Criterios ganados por modelo:\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+for(i in 1:nrow(victorias)) {
+  cat(sprintf("%s: %d de 6 criterios\n",
+              victorias$Modelo[i],
+              victorias$Total_victorias[i]))
+}
+cat("\n")
+
+# Modelo ganador
+modelo_ganador_idx <- which.max(victorias$Total_victorias)
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+cat("🏆 RECOMENDACIÓN FINAL\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+if(victorias$Total_victorias[1] == victorias$Total_victorias[2]) {
+  cat("RESULTADO: AMBOS MODELOS SON ESTADÍSTICAMENTE EQUIVALENTES\n\n")
+  cat("Ambos modelos (SQRT y LOG) tienen desempeño prácticamente idéntico.\n")
+  cat("La elección puede basarse en:\n")
+  cat("  • Facilidad de interpretación: SQRT es más intuitivo\n")
+  cat("  • Estabilidad en valores extremos: LOG maneja mejor valores atípicos\n")
+  cat("  • Preferencia del investigador o contexto del estudio\n\n")
+} else {
+  modelo_ganador <- victorias$Modelo[modelo_ganador_idx]
+  cat(sprintf("MODELO RECOMENDADO: %s\n\n", modelo_ganador))
+  cat(sprintf("El modelo %s es superior en %d de 6 criterios evaluados:\n",
+              modelo_ganador, victorias$Total_victorias[modelo_ganador_idx]))
+
+  criterios_ganados <- c("R²", "RMSE", "MAE", "Bias", "Normalidad K-S", "Ajuste K-S")
+  ganados <- criterios_ganados[as.logical(victorias[modelo_ganador_idx, -c(1, ncol(victorias))])]
+
+  for(criterio in ganados) {
+    cat(sprintf("  ✓ %s\n", criterio))
+  }
+  cat("\n")
+}
+
+cat("═══════════════════════════════════════════════════════════════════════════════\n")
+```
+
+
+
+```{r}
+
+
+# Función para generar muestras de la distribución posterior usando media y SD
+generar_distribucion <- function(mean, sd, n = 5000) {
+  rnorm(n, mean = mean, sd = sd)
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTRAER DISTRIBUCIONES DE LOS 2 MODELOS (SQRT Y LOG)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# MODELO SQRT
+dist_sqrt <- data.frame(
+  Alpha = generar_distribucion(model_fit$summary.fixed[1, "mean"],
+                               model_fit$summary.fixed[1, "sd"]),
+  Beta = generar_distribucion(model_fit$summary.fixed[2, "mean"],
+                              model_fit$summary.fixed[2, "sd"]),
+  Eta = generar_distribucion(model_fit$summary.fixed[3, "mean"],
+                             model_fit$summary.fixed[3, "sd"]),
+  Modelo = "SQRT"
+) %>%
+  pivot_longer(cols = c(Alpha, Beta, Eta),
+               names_to = "Coeficiente",
+               values_to = "Valor") %>%
+  mutate(
+    Coeficiente = case_when(
+      Coeficiente == "Alpha" ~ "α (Intercepto)",
+      Coeficiente == "Beta" ~ "β (CCI)",
+      Coeficiente == "Eta" ~ "η (GEDI)"
+    ),
+    Coeficiente = factor(Coeficiente,
+                         levels = c("α (Intercepto)", "β (CCI)", "η (GEDI)"))
+  )
+
+# MODELO LOG
+dist_log <- data.frame(
+  Alpha = generar_distribucion(model_log$summary.fixed[1, "mean"],
+                               model_log$summary.fixed[1, "sd"]),
+  Beta = generar_distribucion(model_log$summary.fixed[2, "mean"],
+                              model_log$summary.fixed[2, "sd"]),
+  Eta = generar_distribucion(model_log$summary.fixed[3, "mean"],
+                             model_log$summary.fixed[3, "sd"]),
+  Modelo = "LOG"
+) %>%
+  pivot_longer(cols = c(Alpha, Beta, Eta),
+               names_to = "Coeficiente",
+               values_to = "Valor") %>%
+  mutate(
+    Coeficiente = case_when(
+      Coeficiente == "Alpha" ~ "α (Intercepto)",
+      Coeficiente == "Beta" ~ "β (CCI)",
+      Coeficiente == "Eta" ~ "η (GEDI)"
+    ),
+    Coeficiente = factor(Coeficiente,
+                         levels = c("α (Intercepto)", "β (CCI)", "η (GEDI)"))
+  )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CREAR TABLAS DE VALORES MÁS PROBABLES (MEDIA POSTERIOR)
+# ══════════════════════════════════════════════════════════════════════════════
+
+valores_probables_sqrt <- data.frame(
+  Modelo = "SQRT",
+  Coeficiente = c("α (Intercepto)", "β (CCI)", "η (GEDI)"),
+  Media = c(
+    model_fit$summary.fixed[1, "mean"],
+    model_fit$summary.fixed[2, "mean"],
+    model_fit$summary.fixed[3, "mean"]
+  )
+) %>%
+  mutate(
+    Coeficiente = factor(Coeficiente,
+                         levels = c("α (Intercepto)", "β (CCI)", "η (GEDI)"))
+  )
+
+valores_probables_log <- data.frame(
+  Modelo = "LOG",
+  Coeficiente = c("α (Intercepto)", "β (CCI)", "η (GEDI)"),
+  Media = c(
+    model_log$summary.fixed[1, "mean"],
+    model_log$summary.fixed[2, "mean"],
+    model_log$summary.fixed[3, "mean"]
+  )
+) %>%
+  mutate(
+    Coeficiente = factor(Coeficiente,
+                         levels = c("α (Intercepto)", "β (CCI)", "η (GEDI)"))
+  )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICO 1: DISTRIBUCIONES DE COEFICIENTES - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║          DISTRIBUCIONES POSTERIORES DE COEFICIENTES - MODELO SQRT            ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+p_sqrt <- ggplot(dist_sqrt, aes(x = Valor)) +
+  geom_density(fill = "#3498db", color = "#2980b9", alpha = 0.6, linewidth = 1.2) +
+
+  # Línea vertical en 0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+
+  # Líneas verticales en el valor más probable
+  geom_vline(data = valores_probables_sqrt,
+             aes(xintercept = Media),
+             color = "#2980b9",
+             linetype = "solid", linewidth = 1.2, alpha = 0.8) +
+
+  # Etiquetas con el valor más probable
+  geom_text(data = valores_probables_sqrt,
+            aes(x = Media, y = 0, label = sprintf("%.4f", Media)),
+            color = "#2980b9",
+            vjust = -0.5, hjust = -0.1, size = 3.5, fontface = "bold",
+            angle = 90) +
+
+  facet_wrap(~ Coeficiente, scales = "free", ncol = 3) +
+  labs(
+    title = "Distribuciones Posteriores de Coeficientes - MODELO SQRT",
+    subtitle = "α (Intercepto), β (CCI) y η (GEDI) | Línea vertical = valor más probable (media posterior)",
+    x = "Valor del coeficiente",
+    y = "Densidad de probabilidad"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_sqrt)
+
+cat("\nINTERPRETACIÓN - MODELO SQRT:\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+cat(sprintf("α (Intercepto): %.4f - Biomasa base en escala sqrt(Mg/ha)\n",
+            valores_probables_sqrt$Media[1]))
+cat(sprintf("β (CCI):        %.4f - Efecto de biomasa ESA CCI\n",
+            valores_probables_sqrt$Media[2]))
+cat(sprintf("η (GEDI):       %.4f - Efecto de altura del dosel GEDI\n\n",
+            valores_probables_sqrt$Media[3]))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICO 2: DISTRIBUCIONES DE COEFICIENTES - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║          DISTRIBUCIONES POSTERIORES DE COEFICIENTES - MODELO LOG             ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+p_log <- ggplot(dist_log, aes(x = Valor)) +
+  geom_density(fill = "#e74c3c", color = "#c0392b", alpha = 0.6, linewidth = 1.2) +
+
+  # Línea vertical en 0
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+
+  # Líneas verticales en el valor más probable
+  geom_vline(data = valores_probables_log,
+             aes(xintercept = Media),
+             color = "#c0392b",
+             linetype = "solid", linewidth = 1.2, alpha = 0.8) +
+
+  # Etiquetas con el valor más probable
+  geom_text(data = valores_probables_log,
+            aes(x = Media, y = 0, label = sprintf("%.4f", Media)),
+            color = "#c0392b",
+            vjust = -0.5, hjust = -0.1, size = 3.5, fontface = "bold",
+            angle = 90) +
+
+  facet_wrap(~ Coeficiente, scales = "free", ncol = 3) +
+  labs(
+    title = "Distribuciones Posteriores de Coeficientes - MODELO LOG",
+    subtitle = "α (Intercepto), β (CCI) y η (GEDI) | Línea vertical = valor más probable (media posterior)",
+    x = "Valor del coeficiente",
+    y = "Densidad de probabilidad"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "grey40", hjust = 0.5),
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_log)
+
+cat("\nINTERPRETACIÓN - MODELO LOG:\n")
+cat("──────────────────────────────────────────────────────────────────────────────\n")
+cat(sprintf("α (Intercepto): %.4f - Biomasa base en escala log(Mg/ha + 1)\n",
+            valores_probables_log$Media[1]))
+cat(sprintf("β (CCI):        %.4f - Efecto de biomasa ESA CCI\n",
+            valores_probables_log$Media[2]))
+cat(sprintf("η (GEDI):       %.4f - Efecto de altura del dosel GEDI\n\n",
+            valores_probables_log$Media[3]))
+
+```
+
+---
+
+## VALIDACION Y VISUALIZACION DE EFECTOS ESPACIALES
+
+### Objetivo Particular: 3. Validar los 3 modelos y visualizar efectos espaciales
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# PREPARAR DATOS PARA LOS 3 MODELOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Extraer vértices válidos (solo Quintana Roo)
+vertices_validos <- unique(as.vector(tv_validos))
+
+# MODELO SQRT
+mean_alpha.spat_sqrt <- model_fit$summary.random[[1]]$mean
+mean_beta.spat_sqrt <- model_fit$summary.random[[2]]$mean
+mean_eta.spat_sqrt <- model_fit$summary.random[[3]]$mean
+
+# MODELO LOG
+mean_alpha.spat_log <- model_log$summary.random[[1]]$mean
+mean_beta.spat_log <- model_log$summary.random[[2]]$mean
+mean_eta.spat_log <- model_log$summary.random[[3]]$mean
+
+# MODELO NONE
+mean_alpha.spat_none <- model_none$summary.random[[1]]$mean
+mean_beta.spat_none <- model_none$summary.random[[2]]$mean
+mean_eta.spat_none <- model_none$summary.random[[3]]$mean
+
+# Crear dataframe consolidado
+mesh_df_consolidated <- data.frame(
+  x = mesh$loc[vertices_validos, 1],
+  y = mesh$loc[vertices_validos, 2],
+  # SQRT
+  alpha_sqrt = mean_alpha.spat_sqrt[vertices_validos],
+  beta_sqrt = mean_beta.spat_sqrt[vertices_validos],
+  eta_sqrt = mean_eta.spat_sqrt[vertices_validos],
+  # LOG
+  alpha_log = mean_alpha.spat_log[vertices_validos],
+  beta_log = mean_beta.spat_log[vertices_validos],
+  eta_log = mean_eta.spat_log[vertices_validos],
+  # NONE
+  alpha_none = mean_alpha.spat_none[vertices_validos],
+  beta_none = mean_beta.spat_none[vertices_validos],
+  eta_none = mean_eta.spat_none[vertices_validos]
+)
+```
+
+## MAPA 1: ALPHA-TILDE (Intercepto Espacial) - Modelo SQRT
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: ALPHA-TILDE (Intercepto Espacial) - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Valor del coeficiente fijo (media posterior)
+alpha_fijo_sqrt <- model_fit$summary.fixed[1, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = alpha_sqrt), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "plasma", name = "α̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de α̃ (Alpha-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo α = %.4f | Efecto espacial α̃ varía por ubicación", alpha_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: ALPHA-TILDE - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+alpha_fijo_sqrt <- model_fit$summary.fixed[1, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# Verificar que el campo existe
+names(mesh_vect)
+
+# 2. Crear raster base con la extensión de tu área
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "alpha_sqrt", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "alpha_sqrt")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = alpha_sqrt)) +
+ scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "α̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  )   +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title = "Distribución Espacial de α̃ (Alpha-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo α = %.4f | Efecto espacial α̃ varía por ubicación",
+                       alpha_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+
+
+## MAPA 2: ALPHA-TILDE (Intercepto Espacial) - Modelo LOG
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: ALPHA-TILDE (Intercepto Espacial) - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+alpha_fijo_log <- model_log$summary.fixed[1, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = alpha_log), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "plasma", name = "α̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de α̃ (Alpha-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo α = %.4f | Efecto espacial α̃ varía por ubicación", alpha_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: ALPHA-TILDE - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+alpha_fijo_log <- model_log$summary.fixed[1, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# 2. Crear raster base
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "alpha_log", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "alpha_log")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = alpha_log)) +
+  scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "α̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  ) +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title    = "Distribución Espacial de α̃ (Alpha-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo α = %.4f | Efecto espacial α̃ varía por ubicación",
+                       alpha_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+
+## MAPA 4: BETA-TILDE (Efecto Espacial de CCI) - Modelo SQRT
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: BETA-TILDE (Efecto Espacial de CCI) - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+beta_fijo_sqrt <- model_fit$summary.fixed[2, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = beta_sqrt), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "inferno", name = "β̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de β̃ (Beta-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo β = %.4f | Efecto espacial β̃ varía por ubicación", beta_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: BETA-TILDE - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+beta_fijo_sqrt <- model_fit$summary.fixed[2, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# 2. Crear raster base
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "beta_sqrt", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "beta_sqrt")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = beta_sqrt)) +
+  scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "β̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  ) +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title    = "Distribución Espacial de β̃ (Beta-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo β = %.4f | Efecto espacial β̃ varía por ubicación",
+                       beta_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+
+## MAPA 5: BETA-TILDE (Efecto Espacial de CCI) - Modelo LOG
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: BETA-TILDE (Efecto Espacial de CCI) - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+beta_fijo_log <- model_log$summary.fixed[2, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = beta_log), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "inferno", name = "β̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de β̃ (Beta-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo β = %.4f | Efecto espacial β̃ varía por ubicación", beta_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: BETA-TILDE - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+beta_fijo_log <- model_log$summary.fixed[2, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# 2. Crear raster base
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "beta_log", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "beta_log")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = beta_log)) +
+  scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "β̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  ) +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title    = "Distribución Espacial de β̃ (Beta-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo β = %.4f | Efecto espacial β̃ varía por ubicación",
+                       beta_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+## MAPA 7: ETA-TILDE (Efecto Espacial de GEDI) - Modelo SQRT
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: ETA-TILDE (Efecto Espacial de GEDI) - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+eta_fijo_sqrt <- model_fit$summary.fixed[3, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = eta_sqrt), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "viridis", name = "η̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de η̃ (Eta-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo η = %.4f | Efecto espacial η̃ varía por ubicación", eta_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: ETA-TILDE - MODELO SQRT
+# ══════════════════════════════════════════════════════════════════════════════
+
+eta_fijo_sqrt <- model_fit$summary.fixed[3, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# 2. Crear raster base
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "eta_sqrt", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "eta_sqrt")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = eta_sqrt)) +
+  scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "η̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  ) +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title    = "Distribución Espacial de η̃ (Eta-tilde) - Modelo SQRT",
+    subtitle = sprintf("Coeficiente fijo η = %.4f | Efecto espacial η̃ varía por ubicación",
+                       eta_fijo_sqrt),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+## MAPA 8: ETA-TILDE (Efecto Espacial de GEDI) - Modelo LOG
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: ETA-TILDE (Efecto Espacial de GEDI) - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+eta_fijo_log <- model_log$summary.fixed[3, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = eta_log), size = 1.5, alpha = 0.85) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  scale_color_viridis(option = "viridis", name = "η̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de η̃ (Eta-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo η = %.4f | Efecto espacial η̃ varía por ubicación", eta_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA CONTINUO: ETA-TILDE - MODELO LOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+eta_fijo_log <- model_log$summary.fixed[3, "mean"]
+
+# 1. Convertir directo desde dataframe a SpatVector
+mesh_vect <- vect(mesh_df_consolidated, 
+                  geom = c("x", "y"), 
+                  crs = "EPSG:32616")
+
+# 2. Crear raster base
+r_base <- rast(ext(mesh_vect), resolution = 500, crs = "EPSG:32616")
+
+# 3. Interpolar con IDW
+r_interp <- interpIDW(r_base, mesh_vect, 
+                      field = "eta_log", 
+                      radius = 50000, 
+                      power = 2)
+
+# 4. Recortar al límite continental
+qroo_vect <- vect(mexico_proj)
+r_mask <- mask(crop(r_interp, qroo_vect), qroo_vect)
+
+# 5. Convertir a dataframe para ggplot
+r_df <- as.data.frame(r_mask, xy = TRUE)
+colnames(r_df) <- c("x", "y", "eta_log")
+r_df <- na.omit(r_df)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA
+# ══════════════════════════════════════════════════════════════════════════════
+
+ggplot() +
+  geom_raster(data = r_df, aes(x = x, y = y, fill = eta_log)) +
+  scale_fill_gradientn(
+    colors = c("#0B3D91", "#1A6BB5", "#4DA6D6", "#F5F5F5",
+               "#F5A623", "#E07B00", "#B85C00"),
+    name   = "η̃ (espacial)",
+    guide  = guide_colorbar(barwidth = 1.2, barheight = 12)
+  ) +
+  geom_sf(data = mexico_proj, fill = NA, color = "white", linewidth = 0.5) +
+  # Borde administrativo destacado
+  geom_sf(data = mexico_proj, fill = NA, color = "black", linewidth = 1) +
+  labs(
+    title    = "Distribución Espacial de η̃ (Eta-tilde) - Modelo LOG",
+    subtitle = sprintf("Coeficiente fijo η = %.4f | Efecto espacial η̃ varía por ubicación",
+                       eta_fijo_log),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  coord_sf(crs = 32616) +
+  theme_minimal() +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle    = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position  = "right",
+    panel.grid       = element_blank(),
+    panel.background = element_rect(fill = "#0d1b2a", color = NA)
+  )
+```
+
+
+## MAPA 9: ETA-TILDE (Efecto Espacial de GEDI) - Modelo NONE
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPA: ETA-TILDE (Efecto Espacial de GEDI) - MODELO NONE
+# ══════════════════════════════════════════════════════════════════════════════
+
+eta_fijo_none <- model_none$summary.fixed[3, "mean"]
+
+ggplot() +
+  geom_sf(data = mexico_proj, fill = "grey98", color = "grey50", linewidth = 0.4) +
+  geom_point(data = mesh_df_consolidated,
+             aes(x = x, y = y, color = eta_none), size = 1.5, alpha = 0.85) +
+  scale_color_viridis(option = "viridis", name = "η̃ (espacial)",
+                      guide = guide_colorbar(barwidth = 1.2, barheight = 12)) +
+  labs(
+    title = "Distribución Espacial de η̃ (Eta-tilde) - Modelo NONE",
+    subtitle = sprintf("Coeficiente fijo η = %.4f | Efecto espacial η̃ varía por ubicación", eta_fijo_none),
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, color = "grey40", hjust = 0.5),
+    legend.position = "right",
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "aliceblue", color = NA)
+  )
+```
+
+---
+
+## DIAGNOSTICO: Por que Beta y Eta son tan pequenos
+
+```{r}
+cat("1. ESCALAS DE LAS VARIABLES\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cat("Variable           Mín      Máx      Media    Desv.Std\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cat(sprintf("NFI (Biomasa)   %7.2f  %7.2f  %7.2f  %7.2f\n",
+            min(DATA$agbd.plot, na.rm=TRUE), max(DATA$agbd.plot, na.rm=TRUE),
+            mean(DATA$agbd.plot, na.rm=TRUE), sd(DATA$agbd.plot, na.rm=TRUE)))
+cat(sprintf("CCI (Biomasa)   %7.2f  %7.2f  %7.2f  %7.2f\n",
+            min(DATA$cci.plot, na.rm=TRUE), max(DATA$cci.plot, na.rm=TRUE),
+            mean(DATA$cci.plot, na.rm=TRUE), sd(DATA$cci.plot, na.rm=TRUE)))
+cat(sprintf("GEDI (Altura)   %7.2f  %7.2f  %7.2f  %7.2f\n",
+            min(DATA$hei.plot, na.rm=TRUE), max(DATA$hei.plot, na.rm=TRUE),
+            mean(DATA$hei.plot, na.rm=TRUE), sd(DATA$hei.plot, na.rm=TRUE)))
+cat("───────────────────────────────────────────────────────────────────────────────\n\n")
+
+cat("2. CORRELACIONES ENTRE VARIABLES\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+cor_matrix <- cor(DATA[, c("agbd.plot", "cci.plot", "hei.plot")], use = "complete.obs")
+rownames(cor_matrix) <- c("NFI", "CCI", "GEDI")
+colnames(cor_matrix) <- c("NFI", "CCI", "GEDI")
+print(round(cor_matrix, 3))
+cat("\n")
+
+# Correlación entre CCI y GEDI
+cor_cci_gedi <- cor(DATA$cci.plot, DATA$hei.plot, use = "complete.obs")
+cat(sprintf("Correlacion CCI-GEDI: %.3f\n", cor_cci_gedi))
+if(abs(cor_cci_gedi) > 0.7) {
+  cat("    ALTA COLINEALIDAD detectada! CCI y GEDI están muy correlacionados.\n")
+  cat("    Esto puede hacer que los coeficientes individuales sean pequeños.\n\n")
+}
+
+cat("\n3. CONTRIBUCIÓN DE LOS EFECTOS ESPACIALES\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+# Varianza de los efectos espaciales vs efectos fijos
+var_alpha_spat <- var(model_fit$summary.random[[1]]$mean, na.rm = TRUE)
+var_beta_spat <- var(model_fit$summary.random[[2]]$mean, na.rm = TRUE)
+var_eta_spat <- var(model_fit$summary.random[[3]]$mean, na.rm = TRUE)
+
+cat(sprintf("Varianza de alpha.spat (efectos espaciales del intercepto): %.4f\n", var_alpha_spat))
+cat(sprintf("Varianza de beta.spat  (efectos espaciales de CCI):         %.4f\n", var_beta_spat))
+cat(sprintf("Varianza de eta.spat   (efectos espaciales de GEDI):        %.4f\n", var_eta_spat))
+cat("\n")
+cat("Los efectos espaciales (alpha.spat, beta.spat, eta.spat) capturan\n")
+cat("   la variabilidad que no se explica por los efectos fijos.\n")
+cat("   Si tienen alta varianza, están 'absorbiendo' mucha información.\n\n")
+
+cat("\n4. MODELO CON EFECTOS FIJOS SOLAMENTE (Sin componente espacial)\n")
+cat("───────────────────────────────────────────────────────────────────────────────\n")
+# Ajustar un modelo simple sin efectos espaciales para comparar
+LM_simple <- lm(sqrt(agbd.plot) ~ cci.plot + hei.plot, data = DATA)
+cat("\nCoeficientes del modelo lineal simple (sin efectos espaciales):\n")
+print(summary(LM_simple)$coefficients[, 1:2])
+cat("\n")
+cat(sprintf("R² del modelo simple: %.4f\n", summary(LM_simple)$r.squared))
+cat(sprintf("R² ajustado:          %.4f\n", summary(LM_simple)$adj.r.squared))
+
+
+```
+
+
+```{r}
+
+```
+

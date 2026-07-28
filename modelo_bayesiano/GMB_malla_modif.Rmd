@@ -1,0 +1,1798 @@
+---
+title: An R Markdown document converted from "/projects/ADE_biomass_harmonization/biomass_harmonization/NASA_CMS_2023/Mexico/GMB_Mexico.ipynb"
+output: html_document
+---
+
+
+---
+
+### RESUMEN DEL SCRIPT
+
+**Objetivo General:**
+Este script tiene como objetivo principal desarrollar un modelo geoestadístico bayesiano (Geostatistical Model-Based, GMB) para estimar la Densidad de Biomasa Aérea (AGBD) en Quintana Roo, México. Para ello, integra datos de campo del Inventario Nacional Forestal (NFI) con productos de teledetección, específicamente el mapa de biomasa de la ESA (CCI) y el mapa de altura del dosel de GEDI.
+
+**Objetivos Particulares:**
+1.  **Cargar y Preprocesar Datos:** Cargar y alinear los datos del NFI, el ráster de biomasa CCI y el ráster de altura GEDI.
+2.  **Construir el Modelo:** Crear un modelo espacial jerárquico utilizando el paquete `INLA` en R para predecir la biomasa del NFI en función de las covariables de teledetección (CCI y GEDI).
+3.  **Validar el Modelo:** Evaluar el rendimiento del modelo final comparando sus predicciones con un subconjunto de datos del NFI que no se utilizó durante el entrenamiento.
+4.  **Aplicar el Modelo (Secciones Opcionales):** Utilizar el modelo entrenado para realizar diversas tareas de predicción, como:
+    *   Rellenar valores de biomasa faltantes (`NA`) en el conjunto de datos del NFI.
+    *   Estimar la biomasa promedio para estratos ecológicos más grandes (DESECON).
+    *   Predecir la biomasa en áreas de interés (ej. zonas de deforestación).
+    *   Comparar las predicciones del modelo con otros mapas de biomasa existentes (ej. el mapa de CONAFOR).
+
+**¿Se puede ejecutar completamente con los datos actuales?**
+**No.** Con los archivos que tienes actualmente, puedes ejecutar exitosamente las secciones de **carga de datos, entrenamiento del modelo y validación del modelo**.
+
+Sin embargo, las **secciones finales de aplicación y comparación no se podrán ejecutar** porque requieren archivos de datos adicionales que no tienes, como el mapa de estratos DESECON y el mapa de biomasa de CONAFOR. En el script se ha añadido una sección que detalla exactamente qué archivos te faltan para poder completar todo el análisis.
+
+---
+
+
+importar bicliotecas
+```{r}
+############## LOAD PACKAGES ###########
+
+library("fmesher")
+library(MatrixModels)
+library(Matrix)
+library(INLA)
+library(inlabru)
+library("jpeg")
+
+library(sf)
+library(terra)
+library(dplyr)
+library(spdep)
+library(raster)
+library(exactextractr)
+library(INLA)
+library(inlabru)
+
+library(ggplot2)
+library(viridis)
+library(sn)
+```
+
+This notebook shows how to integrate Mexican NFI-estimated AGBD (3rd cycle), ESA CCI Biomass AGBD (see https://climate.esa.int/en/projects/biomass/) and GEDI Forest Height estimates (see https://glad.umd.edu/dataset/gedi). 
+
+It is based on the FAIR (findable, accessible, interoperable, and replicable) Data Principles (Wilkinson et al., 2016), and relies on the computational power of the INLA Package in R (https://www.r-inla.org/).  
+
+Practical applications are demonstrated at the end of this notebook. They include using our models for gap-filling Mexico's NFI, and estimation of mean AGBD (with associated uncertainty) in their forest/administrative strata. 
+
+We have also created two psuedo areas where diturbance will occur in the future. At the end of this notebook, we will predict AGBD in these areas before disturbance using all of the above data!
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+################################# Model-assisted vs model-based #################################
+
+The approach presented in this notebook is a Geostatistical Model-Based (GMB) approach. 
+
+As noted from McRoberts et at (2022): With model-based inference each population unit is assumed to have an entire distribution of possible values as opposed to design-based inference, for which each population unit is assumed to have one and only one possible value. Standard model-based terminology specifies use of the verb “to predict” when referring to random variables and “to estimate” when referring to fixed value parameters. Model-based inferences do not require probability samples, although they can be used, and in many instances may be preferable.
+
+Bayesian inference is used in our approach, whereby we approximate the distribution of our model parameters and predict AGBD at any given location. 
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+################################# Geostatistical Model-based Estimation #########################
+
+Our target variable (AGBD) at any given location (s) is assumed to follow the following linear model
+
+\begin{align}
+y(s) = \alpha + \beta.x(s) + \epsilon(s)
+\end{align}
+
+Where y(s) is the estimated AGBD at location s, and x(s) is a covariate (e.g. CCI Biomass map). Further, $\epsilon(s)$ is the random error. This should be straightforward to solve. However, the errors of $\alpha$ and $\beta$ could be spatially varying across the extent of Mexico, and hence may not be "fixed". To deal with this, we add a spatially-varying term to $\alpha$ and $\beta$ that will capture this variance.  
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x(s) + \epsilon(s)
+\end{align}
+
+Further, if you wanted to add another covariate (e.g. the CCI as well as a map of GEDI height estimates) to predict AGBD, the model will look like
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x1(s) + (\eta + \tilde{\eta}(s)).x2(s) + \epsilon(s) 
+\end{align}
+
+Most of the values should be familiar. $\alpha$, $\beta$ and $\eta$ are constant regression parameters. x1 and x2 are our covariates (here, the CCI map and the GEDI height map). $\alpha$, $\beta$ and $\eta$ have associated errors $\tilde{\alpha}$, $\tilde{\beta}$ and $\tilde{\eta}$ that are spatially autocorrelated. These errors capture the spatially-varying component of $\alpha$, $\beta$ and $\eta$. If you solve this equation at every location s, you will have accounted for the spatial dependence among residuals of the model. In a Bayesian hierarchical framework, it is possible to estimate the spatial covariance parameters and, hence, propagate their uncertainties through to the prediction of the outcome variable (Babcock et al. 2015). 
+
+A caveat, however, is that solving the above model is natively is computationally expensive when the number of observations becomes large. We can circumvent this by splitting Mexico up into (very) small regions. This is done by the use of a mesh, and approximating the model outputs for each node/vertex of the mesh. So, we first define an underlying "mesh", which draws a graph of triangles across the study area. On the vertices of triangles, we define a neighbor-based spatial model where two vertices are neighbors if there is a triangle edge connecting them. To extend this to continuous locations, the value of $\tilde{\alpha}$, $\tilde{\beta}$ and $\tilde{\eta}$ at any location (s) lying within a triangle is linearly interpolated from the 3 vertices of the containing triangle. The reason why this is more computationally effecient is that the process on the vertices is sparse, i.e. for any given vertex, it only needs the information from the connected vertices. This will become clearer as we go through the code. 
+
+```{r}
+### Objetivo Particular: 1. Cargar y Preprocesar Datos
+
+######################## LOAD THE OUTLINE OF MEXICO AND ADMIN BOUNDARIES #############
+options(repr.plot.width=10, repr.plot.height=10)
+
+# Carga el límite y lo proyecta a 32616
+mexico = st_read("C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/QuintanaRoo_Entidad_wgs84.gpkg", quiet = TRUE) %>% st_union() %>% st_transform(crs = 32616) 
+
+```
+
+
+
+
+
+```{r}
+# ########################## READ THE MEXICAN NFI DATA ###################################
+
+
+plot_WGS84 <- st_read("C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/INF_WGS84.gpkg", 
+                       quiet = TRUE)
+
+# ========================== CONVERSIÓN DE UNIDADES ==========================
+# Suma biomasa por individuo a nivel parcela y convierte kg → Mg/ha
+
+# plot_WGS84 <- plot_WGS84 %>%
+#   group_by(IdConglomerado) %>%
+#   mutate(
+#     biomasa_Mg_ha = sum(biomasa_kg_C3, na.rm = TRUE) / 1000  # kg por parcela → Mg/ha
+#   ) %>%
+#   ungroup() %>%
+#   filter(
+#     !is.na(biomasa_Mg_ha),
+#     biomasa_Mg_ha > 0
+#   )
+
+# ========================== TRAIN / TEST SPLIT ==========================
+
+dt <- sort(sample(nrow(plot_WGS84), nrow(plot_WGS84) * .9))
+plot_WGS84   <- plot_WGS84[dt, ]   # 90% entrenamiento
+plot_WGS84_T <- plot_WGS84[-dt, ]  # 10% prueba
+
+# ========================== COORDENADAS Y PROYECCIÓN ==========================
+
+loc.plot.WGS84 <- st_coordinates(plot_WGS84)           # coordenadas en WGS84
+plot <- plot_WGS84 %>% st_transform("epsg:32616")       # reproyectar a UTM zona 16N
+loc.plot <- st_coordinates(plot)                        # coordenadas en UTM (metros)
+
+# ========================== VARIABLE RESPUESTA ==========================
+# 
+agbd.plot <- plot$biomasa_kg_C3  # ahora en Mg/ha en lugar de kg
+# 
+# # Verifica:
+# print(length(agbd.plot))
+# print(summary(agbd.plot))         # útil para ver rango de valores
+
+```
+
+```{r}
+library(geodata)
+library(sf)
+library(ggplot2)
+
+# Capa de México a nivel municipio (nivel 2)
+mexico_mun <- gadm(country = "MEX", level = 2, path = tempdir()) %>% 
+              st_as_sf()
+
+# Filtrar solo Quintana Roo
+qroo <- mexico_mun %>% filter(NAME_1 == "Quintana Roo")
+
+# Filtrar parcelas dentro de Quintana Roo
+parcelas_qroo <- st_filter(plot_WGS84, qroo)
+
+# Mapa
+ggplot() +
+  # Fondo: municipios de Quintana Roo
+  geom_sf(data = qroo, fill = "grey90", color = "grey50", linewidth = 0.4) +
+  
+ 
+  # Puntos de parcelas
+  geom_sf(data = parcelas_qroo, 
+          aes(color = biomasa_kg_C3), 
+          size = 2, alpha = 0.9) +
+  
+  # Paleta verde
+  scale_color_gradientn(
+    colors = c("#ffffcc", "#78c679", "#238443", "#004529"),
+    name   = "Biomasa\n(Mg/ha)"
+  ) +
+  
+  labs(
+    title    = "Biomasa Aérea por Parcela del INFyS",
+    subtitle = "Quintana Roo — División municipal",
+    caption  = "Fuente: INFyS - CONAFOR | GADM",
+    x = "Longitud", y = "Latitud"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+# ============================================
+# MAPA DE ALTURA DE VEGETACIÓN (GEDI) - QUINTANA ROO
+# Limitado a 0-30 metros
+# ============================================
+
+library(terra)
+library(ggplot2)
+library(tidyterra)
+
+# Cargar el raster de altura
+hei.rast <- rast("C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/tif_limpios/hei.tif")
+
+# ============================================
+# MAPA - Altura de 0 a 30 metros
+# ============================================
+
+ggplot() +
+  geom_spatraster(data = hei.rast) +
+  scale_fill_gradientn(
+    colors = c("black", "saddlebrown", "tan", "yellowgreen", "forestgreen", "darkgreen"),
+    name = "Altura\n(m)",
+    na.value = "transparent",
+    limits = c(0, 30),
+    oob = scales::squish
+  ) +
+  labs(
+    title = "Altura de Vegetación (GEDI-NASA) en Quintana Roo",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+```{r}
+summary(hei.rast)
+```
+
+
+
+```{r}
+# ============================================
+# HISTOGRAMA DE ALTURA DE VEGETACIÓN (GEDI)
+# Limitado a 0-30 metros
+# ============================================
+
+# Extraer los valores como vector
+valores <- values(hei.rast, na.rm = TRUE)
+
+# Convertir a dataframe para ggplot
+df <- data.frame(Altura = as.numeric(valores))
+
+# Filtrar valores entre 0 y 30 metros
+df <- df[df$Altura >= 0 & df$Altura <= 30, , drop = FALSE]
+
+# Histograma
+ggplot(df, aes(x = Altura)) +
+  geom_histogram(bins = 50, fill = "forestgreen", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribución de Altura de Vegetación (GEDI-NASA)",
+    subtitle = "Quintana Roo",
+    x = "Altura (m)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+# Densidad (alternativa más suave)
+ggplot(df, aes(x = Altura)) +
+  geom_density(fill = "yellowgreen", alpha = 0.6) +
+  labs(
+    title = "Distribución de Altura de Vegetación (GEDI-NASA)",
+    subtitle = "Quintana Roo",
+    x = "Altura (m)",
+    y = "Densidad"
+  ) +
+  theme_minimal()
+
+# Estadísticas básicas (solo 0-30 m)
+summary(df$Altura)
+```
+
+```{r}
+
+
+# Cargar el raster
+cci.rast <- rast("C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/tif_limpios/biomasa.tif")
+
+# Extraer los valores como vector
+valores <- values(cci.rast, na.rm = TRUE)
+
+# Convertir a dataframe para ggplot
+df <- data.frame(AGBD = as.numeric(valores))
+
+# Histograma
+ggplot(df, aes(x = AGBD)) +
+  geom_histogram(bins = 50, fill = "forestgreen", color = "white", alpha = 0.8) +
+  labs(
+    title = "Distribución de Biomasa Aérea (CCI-ESA)",
+    subtitle = "Quintana Roo",
+    x = "AGBD (Mg/ha)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+# Densidad (alternativa más suave)
+ggplot(df, aes(x = AGBD)) +
+  geom_density(fill = "yellowgreen", alpha = 0.6) +
+  labs(
+    title = "Distribución de Biomasa Aérea (CCI-ESA)",
+    x = "AGBD (Mg/ha)",
+    y = "Densidad"
+  ) +
+  theme_minimal()
+
+# Estadísticas básicas
+summary(valores)
+```
+
+```{r}
+
+ggplot() +
+  geom_spatraster(data = cci.rast) +
+  scale_fill_gradientn(
+    colors = c("black","lightyellow","khaki","gold","yellowgreen", "forestgreen", "darkgreen"),
+    name = "AGBD\n(Mg/ha)",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Biomasa Aérea (CCI-ESA) en Quintana Roo",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+
+```
+
+
+
+```{r}
+
+
+# In case the weighted-average of pixels under the plot of radius 56.4 m is required, please use the lines below 
+cci.plot = exactextractr::exact_extract(cci.rast, st_buffer(plot,56.42), 'mean')
+hei.plot = exactextractr::exact_extract(  hei.rast,   st_buffer(plot, 56.42),   'mean')
+ggplot() + coord_sf(crs = 32616) + geom_point(aes(x = loc.plot[,1], y = loc.plot[,2], col = cci.plot),size=2) + scale_color_viridis()+ labs(title = " Biomasa aérea CCI-ESA extraída en parcelas INFyS") # make a map to see plot locations and the CCI AGBD values at each location
+
+ggplot() + coord_sf(crs = 32616) + geom_point(aes(x = loc.plot[,1], y = loc.plot[,2], col = hei.plot),size=2) + scale_color_viridis()+ labs(title = " GEDI extraída en parcelas INFyS") # make a map to see plot locations and the CCI AGBD values at each location
+
+
+DATA_FULL <- data.frame(
+  X_coord = loc.plot[,1],
+  Y_coord = loc.plot[,2],
+  cci.plot = cci.plot,  # Columna para la Biomasa CCI
+  hei.plot = hei.plot,  # Columna para la Altura GEDI
+  agbd.plot = agbd.plot # Columna para la Biomasa NFI
+  
+) 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GUARDAR PRODUCTOS DERIVADOS EN GMB_MODIFICADO
+# ══════════════════════════════════════════════════════════════════════════════
+output_dir <- "C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/GMB_MODIFICADO"
+write.csv(DATA_FULL, file.path(output_dir, "NFI_CCI_GEDIheights_2.csv"), row.names=FALSE)
+
+
+
+
+```
+
+
+
+```{r}
+# ── Librerías ────────────────────────────────────────────────────────────────
+library(ggplot2)
+
+# ── Datos ────────────────────────────────────────────────────────────────────
+# Leer desde GMB_MODIFICADO
+output_dir <- "C:/Users/katy/Documents/Tesis_katy_github/codigo/CONAFOR/GMB_MODIFICADO"
+DATA <- read.csv(file.path(output_dir, "NFI_CCI_GEDIheights_2.csv"))
+
+cci.plot  <- DATA$cci.plot
+hei.plot  <- DATA$hei.plot
+agbd.plot <- DATA$agbd.plot
+loc.plot  <- data.frame(X = DATA$X_coord, Y = DATA$Y_coord)
+
+# ── Opciones de gráfico ───────────────────────────────────────────────────────
+options(repr.plot.width = 6, repr.plot.height = 4)
+
+# ── GRÁFICA 1: NFI vs. CCI ───────────────────────────────────────────────────
+ggplot(data = DATA, aes(x = agbd.plot, y = cci.plot)) +
+  geom_bin2d(bins = 100) +
+  scale_fill_gradient(
+    low  = "lightblue",
+    high = "darkblue",
+    name = "Conteo"
+  ) +
+  xlab("NFI-estimated AGBD [Mg/ha]") +
+  ylab("CCI-estimated AGBD [Mg/ha]") +
+  ggtitle("NFI vs. CCI") +
+  theme_bw() +
+  theme(plot.title = element_text(color = "red", size = 14, face = "bold.italic"))
+
+# ── GRÁFICA 2: NFI vs. GEDI ──────────────────────────────────────────────────
+ggplot(data = DATA, aes(x = agbd.plot, y = hei.plot)) +
+  geom_bin2d(bins = 100) +
+  scale_fill_gradient(
+    low  = "lightblue",
+    high = "darkblue",
+    name = "Conteo"
+  ) +
+  xlab("NFI-estimated AGBD [Mg/ha]") +
+  ylab("GEDI-estimated heights [m]") +
+  ggtitle("NFI vs. GEDI") +
+  theme_bw() +
+  theme(plot.title = element_text(color = "red", size = 14, face = "bold.italic"))
+
+# ── Transformación logarítmica ────────────────────────────────────────────────
+# Se usa log1p (log(1+x)) para evitar log(0) = -Inf cuando agbd.plot = 0
+DATA$agbd.plot_log <- log1p(DATA$agbd.plot)
+
+# ── GRÁFICA 3: log(NFI) vs. CCI ──────────────────────────────────────────────
+ggplot(data = DATA, aes(x = agbd.plot_log, y = cci.plot)) +
+  geom_bin2d(bins = 100) +
+  scale_fill_gradient(
+    low  = "lightblue",
+    high = "darkblue",
+    name = "Conteo"
+  ) +
+  xlab("log(1 + NFI-estimated AGBD) [Mg/ha]") +
+  ylab("CCI-estimated AGBD [Mg/ha]") +
+  ggtitle("log(NFI AGB) vs. CCI") +
+  theme_bw() +
+  theme(plot.title = element_text(color = "red", size = 14, face = "bold.italic"))
+
+# ── GRÁFICA 4: log(NFI) vs. GEDI ─────────────────────────────────────────────
+ggplot(data = DATA, aes(x = agbd.plot_log, y = hei.plot)) +
+  geom_bin2d(bins = 100) +
+  scale_fill_gradient(
+    low  = "lightblue",
+    high = "darkblue",
+    name = "Conteo"
+  ) +
+  xlab("log(1 + NFI-estimated AGBD) [Mg/ha]") +
+  ylab("GEDI-estimated heights [m]") +
+  ggtitle("log(NFI AGB) vs. GEDI") +
+  theme_bw() +
+  theme(plot.title = element_text(color = "red", size = 14, face = "bold.italic"))
+```
+
+
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# TRANSFORMACIÓN DE DATOS PARA EL MODELO
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔧 CAMBIA ESTA VARIABLE para usar diferentes transformaciones:
+#    "sqrt"     - Raíz cuadrada (actual)
+#    "log"      - Logaritmo natural: log(1+x)
+#    "log10"    - Logaritmo base 10: log10(1+x)
+#    "none"     - Sin transformación (datos originales)
+#    "abs"      - Valor absoluto
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "sqrt"  # ← CAMBIA AQUÍ para probar diferentes transformaciones
+
+# Aplicar la transformación seleccionada
+agbd.plot <- switch(TRANSFORMACION,
+                    "sqrt"  = sqrt(DATA$agbd.plot),
+                    "log"   = log1p(DATA$agbd.plot),  # log(1+x) para evitar log(0)
+                    "log10" = log10(DATA$agbd.plot + 1),
+                    "none"  = DATA$agbd.plot,
+                    "abs"   = abs(DATA$agbd.plot),
+                    sqrt(DATA$agbd.plot)  # default
+)
+
+# Actualizar también en el dataframe
+DATA$agbd.plot_transformed <- agbd.plot
+
+cat("══════════════════════════════════════════════════════\n")
+cat("TRANSFORMACIÓN APLICADA:", TRANSFORMACION, "\n")
+cat("Rango de valores transformados:", range(agbd.plot, na.rm = TRUE), "\n")
+cat("══════════════════════════════════════════════════════\n")
+
+LM_model <- (lm((agbd.plot)~(cci.plot)+(hei.plot), na.action=na.omit))
+# summary(LM_model)
+print("--------GREAT, I'VE SOLVED A LINEAR REGRESSION MODEL ABOVE -----------")
+
+### However, in our case, we want to capture the model parameters (alpha, beta and eta) and view their distribution, i.e. we want the Bayesian model output
+### In other words, we want to see what are their posterior distributions (min, max, 25th, 50th and 75th percentile) when modelled as Guassian Processes
+### See the example below, which uses the INLA package to do so 
+
+formula = (agbd.plot)~(cci.plot)+(hei.plot)
+INLA_model <- inla(formula, data=DATA, family="gaussian",control.compute=list(config = T, dic = T, waic = T, cpo=TRUE)) #option cpo is a leave-one-out cross validation
+# summary(INLA_model)
+print("--------GREAT, I'VE SOLVED THE REGRESSION MODEL ABOVE USING PACKAGE INLA ---")
+
+#### Let's do a quick comparison, just to see how our outputs compare 
+output <- cbind(summary(LM_model)$coef[,1:2],INLA_model$summary.fixed[,1:5]) # Looking great! 
+colnames(output) <- c("lm():Mean","lm():SE","inla():Mean","inla():SD","inla():0.025quant","inla():0.5quant","inla():0.975quant")
+output # Looking great! 
+
+#### The first 2 columns give you the same estimates if you had done just a linear regression in R as usual
+#### The last 6 columns give you the INLA estimates of the model parameters
+### Notice the similarities! LM gives you mean and SE, and INLA gives you the mean, SD and all quantiles
+### Here is also a nice tutorial that can help understand the differences between INLA and a usualy linear regression in R: https://julianfaraway.github.io/brinla/examples/chicago.html
+### And one more tutorial if that wasn't enough: https://www.paulamoraga.com/book-geospatial/sec-inla.html
+```
+
+### Objetivo Particular: 2. Construir el Modelo (Introducción)
+
+## BUILDING THE GEOSPATIAL MODEL WE DEFINED FOR MEXICO ###########
+
+Since we are now familiar with INLA, let's try to solve our model: 
+
+\begin{align}
+y(s) = (\alpha + \tilde{\alpha}(s)) + (\beta + \tilde{\beta}(s)).x1(s) + (\eta + \tilde{\eta}(s)).x2(s) + \epsilon(s)
+\end{align}
+
+Solving this model is computationally expensive. Instead, an approximation of the solutions can be constructed, typically based upon discretizations of space, i.e. breaking Mexico up by a mesh. The solutions then, in turn, are an approximation of the true solution. This method of discretization is called a finite element method (FEM), very commonly used in physics and engineering.
+
+The steps followed below are first explained in words: 
+
+(1) We start with building a mesh over Mexico. These are our finite elements. 
+
+(2) We then define a spatial model for each spatially-varying parameter ($\tilde{\alpha}(s)$, $\tilde{\beta}(s)$ and $\tilde{\eta}(s)$), and we ask INLA to solve it!
+
+Once INLA has done its job, we can check our model residuals and make predictions at our hold-out 10% of NFI plot locations. 
+
+Also, we can get values of $(\alpha + \tilde{\alpha}(s))$, $(\beta + \tilde{\beta}(s))$ and $(\eta + \tilde{\eta}(s))$ for any location we want! 
+
+Since we will have the model's fixed parameters and their spatially-varying components, we can get predicted AGBD at any location we want. 
+This means, we can find a patch of newly deforested land, and predict what baseline AGBD would have been there (for example). 
+We can also predict AGBD and compare it to CONAFOR's 1 km gridded map. 
+
+
+```{r}
+################### MAKING A MESH SURFACE OVER MEXICO ###################
+library(INLA)
+library(sf)
+library(ggplot2)
+
+options(repr.plot.width = 10, repr.plot.height = 10)
+
+# --- 1. PREPARACIÓN Y LIMPIEZA DE OBJETOS ---
+mexico_proj <- st_make_valid(mexico) %>% st_transform(crs = 32616)
+
+data_for_plot <- data.frame(
+  X    = loc.plot[, 1],
+  Y    = loc.plot[, 2],
+  agbd = agbd.plot
+)
+data_for_plot <- na.omit(data_for_plot)
+
+# --- 2. CREACIÓN DE LA MALLA SPDE ---
+max.edge     <- 15 * 10^3  # 15 km
+mexico.buffer <- st_buffer(mexico_proj, dist = max.edge * 5)  # Buffer 75 km
+
+mesh <- inla.mesh.2d(
+  boundary = list(
+    as(mexico_proj,  "Spatial"),
+    as(mexico.buffer, "Spatial")
+  ),
+  max.edge = c(max.edge, 3 * max.edge),
+  cutoff   = 2 * max.edge / 3,
+  offset   = c(max.edge, 5 * max.edge)
+)
+
+# --- 3. RECORTE DE TRIÁNGULOS POR CENTROIDES ---
+# Extraer la matriz de triángulos (índices de vértices)
+tv <- mesh$graph$tv
+
+# Calcular el centroide de cada triángulo
+centroides <- data.frame(
+  x = (mesh$loc[tv[, 1], 1] + mesh$loc[tv[, 2], 1] + mesh$loc[tv[, 3], 1]) / 3,
+  y = (mesh$loc[tv[, 1], 2] + mesh$loc[tv[, 2], 2] + mesh$loc[tv[, 3], 2]) / 3
+)
+
+centroides_sf <- st_as_sf(centroides, coords = c("x", "y"), crs = 32616)
+
+# Buffer pequeño sobre México para incluir bordes costeros e insulares
+mexico_borde <- st_buffer(mexico_proj, dist = 50)
+
+# Triángulos cuyo centroide cae dentro del polígono ampliado
+triangulos_validos <- st_within(centroides_sf, mexico_borde, sparse = FALSE)[, 1]
+tv_validos          <- tv[triangulos_validos, ]
+
+# --- 4. RECONSTRUIR ARISTAS DE LOS TRIÁNGULOS VÁLIDOS ---
+edges_validos <- rbind(
+  cbind(tv_validos[, 1], tv_validos[, 2]),
+  cbind(tv_validos[, 2], tv_validos[, 3]),
+  cbind(tv_validos[, 1], tv_validos[, 3])
+)
+
+mesh_df_validos <- data.frame(
+  x    = mesh$loc[edges_validos[, 1], 1],
+  y    = mesh$loc[edges_validos[, 1], 2],
+  xend = mesh$loc[edges_validos[, 2], 1],
+  yend = mesh$loc[edges_validos[, 2], 2]
+)
+
+# --- 5. VISUALIZACIÓN ---
+ggplot() +
+  
+  geom_sf(data = mexico_proj,
+          fill = "grey95", color = "grey40", linewidth = 0.5) +
+  
+  geom_segment(data = mesh_df_validos,
+               aes(x = x, y = y, xend = xend, yend = yend),
+               color = "steelblue", linewidth = 0.2, alpha = 0.7) +
+  
+  geom_point(data = data_for_plot,
+             aes(x = X, y = Y, fill = agbd),
+             shape = 21, size = 2.5, color = "white", stroke = 0.3) +
+  
+  scale_fill_gradientn(
+    colors = c("#ffffcc", "#78c679", "#238443", "#004529"),
+    name   = "Biomasa\n(Mg/ha)"
+  ) +
+  
+  labs(
+    title    = "Malla SPDE — México",
+    subtitle = paste0("Triángulos: ", sum(triangulos_validos), " | Nodos: ", mesh$n),
+    caption  = "Fuente: INFyS - CONAFOR",
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+k = mesh$n 
+print(paste("Número de vértices de la malla (k):", k))
+```
+
+
+```{r}
+######################## INTERPOLATING OUR MESH TO EACH PLOT ##################
+
+# Now, we have our data at NFI locations and we have our mesh with k vertices. Wonderful! 
+# Next, we need a way to link the k mesh vertices to the n plot locations.
+# This is achieved using a projector matrix (A.plot). For every NFI plot location, we come up with three weights, corresponding to the proportional 
+# area to nodes/vertices of each triangle containing each NFI plot. We will explain this better in an accompanying presentation at the workshop.
+# The sum of the three weights given to three vertices contain an NFI plot will be 1.   
+# This results in a huge matrix of dimensions n_NFI_plots x n_vertices matrix.
+
+options(repr.plot.width=8, repr.plot.height=5)
+
+# Example_weights <- readJPEG("/projects/ADE_biomass_harmonization/biomass_harmonization/NASA_CMS_2023/Mexico/Aplot.jpg",native=TRUE)
+# plot(0:1,0:1,type="n",ann=FALSE,axes=FALSE)
+# rasterImage(Example_weights,0,0,1,1)
+# 
+# Example_Aplot <- readJPEG("/projects/ADE_biomass_harmonization/biomass_harmonization/NASA_CMS_2023/Mexico/Aplot_matrix.jpg",native=TRUE)
+# plot(0:1,0:1,type="n",ann=FALSE,axes=FALSE)
+# rasterImage(Example_Aplot,0,0,1,1)
+
+loc.plot = data.matrix(loc.plot)
+A.plot = inla.spde.make.A(mesh = mesh, loc = loc.plot)
+
+# You can look more closely into what A.plot looks like, but it should be rather intuitive: 
+paste("These are the number of rows (NFI plots) times the number of columns (vertices) in our mesh:", dim(A.plot)[1], "and", dim(A.plot)[2]) 
+# dim(A.plot) gives you number of rows (9863 NFI plots) x number of columns (16094 vertices in our mesh)
+# Matrix::rowSums(A.plot) ### And this tells you that the sum of all rows = 1, meaning the sum of weights at each NFI plot is 1
+
+### Finally, here is a great resource for understanding spatial effects: https://www.paulamoraga.com/book-geospatial/sec-geostatisticaldataexamplespatial.html
+```
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Definición de Modelos Espaciales SPDE)
+
+######################## MAKING A SPATIAL MODEL FOR ALPHA, BETA AND ETA  ##################
+
+# This part is a little tricky. What you want to do is establish that alpha_tilde, beta_tilde, and eta_tilde 
+# must be modelled with a covariance function, such that covariance between any two locations will depend on the relative 
+# distance between them. There are many ways to define this function, but commonly used family of covariance function is the 
+# Matérn covariance function. Matérn covariance function is probably the most commonly used one in geostatistics. 
+# We do not want to dive into the math here (we can do that later), but let's, for now, understand just this: 
+
+# Taking alpha_tilde as an example, we want to know the "range" (in units of meters) at which alpha_tilde will 
+# decay in correlation with distance. Similarly, we want to know the "range" at which beta_tilde and eta_tilde decays. 
+# And, we want to know what is the standard deviation (SD) of the Guassian process. 
+
+# In the followng, we simply supply these spatial models using INLA. We also supply some "prior probability" bound on the data, meaning, we give 
+# INLA a starting point to optimize the model fitting. This is just a best guess on how the spatially-varying parameters are expected to behave. 
+
+# Priors for the varying intercept alpha_tilde
+spde.alpha = inla.spde2.pcmatern(mesh, 
+                                 prior.range = c(30*10^3, 0.01), # This says the probability that the range is LESS than 30 km is 0.01
+                                 prior.sigma = c(60, 0.01)) # This says the probability that the SD is GREATER than 60 Mg/ha is 0.01
+
+# Priors for the varying coefficient beta_tilde
+spde.beta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations as above here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the SD is GREATER than 1 is 0.5
+
+# Priors for the varying coefficient eta_tilde
+spde.eta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations as above here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the SD is GREATER than 1 is 0.5
+
+# If you are keen on understanding the range and SD parameters and intuitively see how the work, here is a nice simulation: 
+```
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Preparación de Datos para INLA)
+
+###################### SETTING UP THE MODEL SO THAT INLA CAN RUN IT ##################
+
+# This cell simply rearranges all the data we have into the right syntax/format needed by INLA to solve the model. 
+# Let's have a recap what data we have:  
+# (1) We have NFI AGBD, CCI AGBD and Forest Height at each NFI location
+# (2) We have an awesome mesh covering Mexico in little triangles that encompass the NFI plot locations
+# (3) We have a projector matrix (A.plot), which gives each NFI location 3 weights from the nearest vertices of the containing triangle
+# (4) We have a spatial-model that will help us understand the spatially-varying errors alpha-tilde, beta-tilde, and eta-tilde
+
+### First, we just construct our formula, which we need to provide to INLA #####
+formula = agbd ~ # This is the NFI-estimated AGBD, which we have to predict
+  -1 +           # This informs INLA that it should not use a default intercept, but use the one we provide
+  intercept +    # Intercept
+  cci +          # CCI values
+  hei +          # Forest height values
+  f(alpha.spat, model = spde.alpha) + # Spatially-varying error term, modelled with spde.alpha
+  f(beta.spat, model = spde.beta) +   # Spatially-varying error term, modelled with spde.beta
+  f(eta.spat, model = spde.eta)       # Spatially-varying error term, modelled with spde.eta
+
+#### Second, we arrange our data so we can supply it to INLA to input in the formula above #####
+# The INLA stack is provided as three separate lists: 
+# (1) The "data" list, which is only our NFI-estimated AGBD at each plot
+# (2) The "A" list, which contains our projection matrices for each model parameter. For alpha, beta and eta, this is just 1. 
+#     But for alpha-tilde, beta-tilde and eta-tilde, we use A.plot to "project" on our mesh nodes! 
+# (3) The "effects" list, which contains the actual values of our model parameters. We have observations of CCI and Forest 
+#     height. For all other model parameters (i.e. the intercept and the random effects), we just supply an index.  
+n.plot <- length(agbd.plot)
+stack = inla.stack(data = list(agbd = agbd.plot),
+                   A = list(1, # tell INLA we expect an intercept, and the projection matrix is just "1"
+                            1, # tell INLA we expect a cci biomass value, and the projection matrix for its parameter is just "1"
+                            1, # tell INLA we expect a forest height value, and the projection matrix for its parameter is just "1"
+                            A.plot, # tell INLA we have a mesh projected onto the plot locations for alpha-tilde 
+                            Diagonal(x = cci.plot)%*%A.plot, # tell INLA to multiply our mesh with CCI values for beta-tilde
+                            Diagonal(x = hei.plot)%*%A.plot),# tell INLA to multiply our mesh with forest height values for eta-tilde
+                   effects = list(
+                     intercept = rep(1, n.plot), # The intercept just given an index equal to 1
+                     cci = cci.plot, # Supply INLA with the CCI values
+                     hei = hei.plot, # Supply INLA with the Forest Height values
+                     alpha.spat = 1:k, # The random effects just need to given unique indices at each mesh node.
+                     beta.spat = 1:k, # The random effects just need to given unique indices at each mesh node.
+                     eta.spat = 1:k # The random effects just need to given unique indices at each mesh node.
+                   ))
+```
+
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Ajuste del Primer Modelo INLA)
+
+###################### SET THE MODEL RUNNING ###############################
+
+model_fit = inla(formula = formula, # Provide the formula
+                 family = 'gaussian', # We assume our data follows a Gaussian generalized linear model (GLM)
+                 data = inla.stack.data(stack), # This line and the one below are simply how we feed INLA the stack.
+                 control.predictor = list(A = inla.stack.A(stack)),
+                 control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE ), # As for Bayesian diagnostics, which help understand results
+                 verbose = TRUE)
+summary(model_fit)
+hist(model_fit$cpo$pit, breaks = 20)
+
+# Guardar en GMB_MODIFICADO
+save(model_fit, file = file.path(output_dir, "INLA_model_fit.RData"))
+
+# A nice feature of fitting models in INLA is that you can ask it to do a leave-one-out cross validation while fitting. This is done by setting cpo = TRUE. 
+# When run, this gives you a PIT (probability integral transform, The PIT is the probability of a new response less than the observed response using a model based on the rest of the data). 
+# We’d expect the PIT values to be uniformly distributed if the model assumptions are correct.
+# If the model represents the observation well, the distribution of the PIT values should be close to a uniform distribution between 0 and 1. 
+
+# load("INLA_model_fit.RData")
+# summary(model_fit)
+# options(repr.plot.width=4, repr.plot.height=4)
+# hist(model_fit$cpo$pit, breaks = 20) 
+```
+```{r}
+### Objetivo Particular: 2. Construir el Modelo (Ajuste del Primer Modelo INLA)
+###################### SET THE MODEL RUNNING ###############################
+model_fit = inla(formula = formula, 
+                 family = 'gaussian', 
+                 data = inla.stack.data(stack), 
+                 control.predictor = list(A = inla.stack.A(stack)),
+                 control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+                 verbose = TRUE)
+
+summary(model_fit)
+
+# ============================================================================
+# VISUALIZACIÓN MEJORADA DEL PIT (Probability Integral Transform)
+# ============================================================================
+
+# Extraer valores PIT y eliminar NAs
+pit_values <- model_fit$cpo$pit
+pit_values <- pit_values[!is.na(pit_values)]
+
+# Crear data frame para ggplot
+pit_df <- data.frame(pit = pit_values)
+
+# Gráfica mejorada con ggplot2
+library(ggplot2)
+
+options(repr.plot.width = 8, repr.plot.height = 6)
+
+ggplot(pit_df, aes(x = pit)) +
+  # Histograma con colores más atractivos
+  geom_histogram(aes(y = after_stat(density)), 
+                 breaks = seq(0, 1, by = 0.05),
+                 fill = "#3498db", 
+                 color = "white", 
+                 alpha = 0.8) +
+  # Línea de referencia para distribución uniforme (modelo ideal)
+  geom_hline(yintercept = 1, 
+             linetype = "dashed", 
+             color = "#e74c3c", 
+             linewidth = 1.2) +
+  # Añadir etiqueta para la línea de referencia
+  annotate("text", x = 0.85, y = 1.15, 
+           label = "Uniforme ideal", 
+           color = "#e74c3c", 
+           size = 3.5, 
+           fontface = "italic") +
+  # Curva de densidad suavizada
+  geom_density(color = "#2c3e50", 
+               linewidth = 1, 
+               linetype = "solid") +
+  # Configuración de ejes
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), 
+                     limits = c(0, 1),
+                     expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0, 0.05)) +
+  # Etiquetas y título
+  labs(
+    title = "Diagnóstico de Calibración del Modelo: PIT Histogram",
+    subtitle = paste0("Probability Integral Transform (n = ", length(pit_values), " observaciones)"),
+    x = "PIT (Probability Integral Transform)",
+    y = "Densidad",
+    caption = "Línea roja punteada = distribución uniforme esperada si el modelo está bien calibrado"
+  ) +
+  # Tema elegante
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", color = "#2c3e50", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, color = "#7f8c8d", hjust = 0.5),
+    plot.caption = element_text(size = 9, color = "#95a5a6", hjust = 0.5),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#ecf0f1")
+  )
+
+# ============================================================================
+# VERSIÓN ALTERNATIVA: Con interpretación visual automática
+# ============================================================================
+
+# Calcular estadísticas para interpretación
+pit_mean <- mean(pit_values)
+pit_sd <- sd(pit_values)
+# Test de uniformidad (Kolmogorov-Smirnov)
+ks_test <- ks.test(pit_values, "punif")
+
+# Determinar interpretación basada en la forma
+interpretation <- if(ks_test$p.value > 0.05) {
+  "✓ Bien calibrado (no se rechaza uniformidad)"
+} else if(pit_sd < 0.28) {  # sd de uniforme(0,1) ≈ 0.289
+  "⚠ Posible sobredispersión (varianza baja)"
+} else {
+  "⚠ Posible subdispersión o sesgo"
+}
+
+# Gráfica con panel de diagnóstico
+ggplot(pit_df, aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), 
+                 breaks = seq(0, 1, by = 0.05),
+                 fill = ifelse(ks_test$p.value > 0.05, "#27ae60", "#e74c3c"), 
+                 color = "white", 
+                 alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#2c3e50", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1.2) +
+  # Añadir caja de estadísticas
+  annotate("rect", xmin = 0.65, xmax = 0.99, ymin = 1.3, ymax = 2.0,
+           fill = "white", color = "#bdc3c7", alpha = 0.9) +
+  annotate("text", x = 0.82, y = 1.85, 
+           label = paste0("Media PIT: ", round(pit_mean, 3)), 
+           size = 3, hjust = 0.5) +
+  annotate("text", x = 0.82, y = 1.65, 
+           label = paste0("SD PIT: ", round(pit_sd, 3)), 
+           size = 3, hjust = 0.5) +
+  annotate("text", x = 0.82, y = 1.45, 
+           label = paste0("KS p-valor: ", format(ks_test$p.value, digits = 3)), 
+           size = 3, hjust = 0.5) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(
+    title = "Diagnóstico PIT del Modelo INLA",
+    subtitle = interpretation,
+    x = "PIT", 
+    y = "Densidad",
+    caption = "Si el histograma es aproximadamente plano, el modelo está bien calibrado"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, 
+                                  color = ifelse(ks_test$p.value > 0.05, "#27ae60", "#e74c3c")),
+    plot.caption = element_text(size = 9, color = "#7f8c8d"),
+    axis.title = element_text(size = 11)
+  )
+
+# Guardar modelo en GMB_MODIFICADO
+save(model_fit, file = file.path(output_dir, "INLA_model_fit.RData"))
+
+# ============================================================================
+# INFORMACIÓN ADICIONAL DEL PIT
+# ============================================================================
+cat("\n========== DIAGNÓSTICO PIT ==========\n")
+cat("Número de observaciones:", length(pit_values), "\n")
+cat("Media PIT:", round(pit_mean, 4), "(esperado: 0.5)\n")
+cat("SD PIT:", round(pit_sd, 4), "(esperado: ~0.289)\n")
+cat("Test Kolmogorov-Smirnov p-valor:", format(ks_test$p.value, digits = 4), "\n")
+cat("Interpretación:", interpretation, "\n")
+cat("=====================================\n")
+```
+
+---
+
+# ═══════════════════════════════════════════════════════════════════════════
+# COMPARACIÓN DE TRANSFORMACIONES - ANÁLISIS DE PIT
+# ═══════════════════════════════════════════════════════════════════════════
+
+A continuación se presentan diferentes transformaciones aplicadas a la variable respuesta (biomasa del INFyS) para evaluar cuál produce el mejor ajuste del modelo según el diagnóstico PIT.
+
+**Objetivo:** Comparar cómo diferentes transformaciones afectan la calibración del modelo geoestadístico bayesiano.
+
+**Transformaciones a probar:**
+1. **Raíz cuadrada** (sqrt) - transformación actual
+2. **Logaritmo natural** (log) - para datos con asimetría positiva
+3. **Logaritmo base 10** (log10) - escala más interpretable
+4. **Sin transformación** (none) - datos originales
+5. **Cuarta raíz** (fourth_root) - transformación más suave que sqrt
+
+---
+
+## 🔬 TRANSFORMACIÓN 1: Raíz Cuadrada (SQRT)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO CON TRANSFORMACIÓN: RAÍZ CUADRADA
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "sqrt"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: RAÍZ CUADRADA (SQRT)                 ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Aplicar transformación
+agbd.plot_sqrt <- sqrt(DATA$agbd.plot)
+
+cat("Rango original:", range(DATA$agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_sqrt, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+formula_sqrt = agbd ~ -1 + intercept + cci + hei +
+  f(alpha.spat, model = spde.alpha) +
+  f(beta.spat, model = spde.beta) +
+  f(eta.spat, model = spde.eta)
+
+stack_sqrt = inla.stack(
+  data = list(agbd = agbd.plot_sqrt),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_sqrt = inla(
+  formula = formula_sqrt,
+  family = 'gaussian',
+  data = inla.stack.data(stack_sqrt),
+  control.predictor = list(A = inla.stack.A(stack_sqrt)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+
+# Diagnóstico PIT
+pit_sqrt <- model_sqrt$cpo$pit[!is.na(model_sqrt$cpo$pit)]
+ks_sqrt <- ks.test(pit_sqrt, "punif")
+
+cat("DIC:", round(model_sqrt$dic$dic, 2), "\n")
+cat("WAIC:", round(model_sqrt$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_sqrt), 4), "\n")
+cat("PIT SD:", round(sd(pit_sqrt), 4), "\n")
+cat("KS p-valor:", format(ks_sqrt$p.value, digits = 4), "\n\n")
+
+# Visualización PIT
+ggplot(data.frame(pit = pit_sqrt), aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#3498db", color = "white", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  annotate("text", x = 0.5, y = 1.8,
+           label = paste0("SQRT | KS p = ", format(ks_sqrt$p.value, digits = 3)),
+           size = 4, fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "PIT Histogram - Transformación RAÍZ CUADRADA",
+       x = "PIT", y = "Densidad") +
+  theme_bw()
+
+# Guardar modelo
+save(model_sqrt, file = file.path(output_dir, "INLA_model_sqrt.RData"))
+```
+
+---
+
+## 🔬 TRANSFORMACIÓN 2: Logaritmo Natural (LOG)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO CON TRANSFORMACIÓN: LOGARITMO NATURAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "log"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: LOGARITMO NATURAL (LOG)              ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Aplicar transformación
+agbd.plot_log <- log1p(DATA$agbd.plot)  # log(1+x) para evitar log(0)
+
+cat("Rango original:", range(DATA$agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_log, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_log = inla.stack(
+  data = list(agbd = agbd.plot_log),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_log = inla(
+  formula = formula_sqrt,  # Misma fórmula
+  family = 'gaussian',
+  data = inla.stack.data(stack_log),
+  control.predictor = list(A = inla.stack.A(stack_log)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+
+# Diagnóstico PIT
+pit_log <- model_log$cpo$pit[!is.na(model_log$cpo$pit)]
+ks_log <- ks.test(pit_log, "punif")
+
+cat("DIC:", round(model_log$dic$dic, 2), "\n")
+cat("WAIC:", round(model_log$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_log), 4), "\n")
+cat("PIT SD:", round(sd(pit_log), 4), "\n")
+cat("KS p-valor:", format(ks_log$p.value, digits = 4), "\n\n")
+
+# Visualización PIT
+ggplot(data.frame(pit = pit_log), aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#27ae60", color = "white", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  annotate("text", x = 0.5, y = 1.8,
+           label = paste0("LOG | KS p = ", format(ks_log$p.value, digits = 3)),
+           size = 4, fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "PIT Histogram - Transformación LOGARITMO NATURAL",
+       x = "PIT", y = "Densidad") +
+  theme_bw()
+
+# Guardar modelo
+save(model_log, file = file.path(output_dir, "INLA_model_log.RData"))
+```
+
+---
+
+## 🔬 TRANSFORMACIÓN 3: Logaritmo Base 10 (LOG10)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO CON TRANSFORMACIÓN: LOGARITMO BASE 10
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "log10"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: LOGARITMO BASE 10 (LOG10)            ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Aplicar transformación
+agbd.plot_log10 <- log10(DATA$agbd.plot + 1)
+
+cat("Rango original:", range(DATA$agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_log10, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_log10 = inla.stack(
+  data = list(agbd = agbd.plot_log10),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_log10 = inla(
+  formula = formula_sqrt,
+  family = 'gaussian',
+  data = inla.stack.data(stack_log10),
+  control.predictor = list(A = inla.stack.A(stack_log10)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+
+# Diagnóstico PIT
+pit_log10 <- model_log10$cpo$pit[!is.na(model_log10$cpo$pit)]
+ks_log10 <- ks.test(pit_log10, "punif")
+
+cat("DIC:", round(model_log10$dic$dic, 2), "\n")
+cat("WAIC:", round(model_log10$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_log10), 4), "\n")
+cat("PIT SD:", round(sd(pit_log10), 4), "\n")
+cat("KS p-valor:", format(ks_log10$p.value, digits = 4), "\n\n")
+
+# Visualización PIT
+ggplot(data.frame(pit = pit_log10), aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#f39c12", color = "white", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  annotate("text", x = 0.5, y = 1.8,
+           label = paste0("LOG10 | KS p = ", format(ks_log10$p.value, digits = 3)),
+           size = 4, fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "PIT Histogram - Transformación LOGARITMO BASE 10",
+       x = "PIT", y = "Densidad") +
+  theme_bw()
+
+# Guardar modelo
+save(model_log10, file = file.path(output_dir, "INLA_model_log10.RData"))
+```
+
+---
+
+## 🔬 TRANSFORMACIÓN 4: Sin Transformación (DATOS ORIGINALES)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO SIN TRANSFORMACIÓN (DATOS ORIGINALES)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "none"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: NINGUNA (DATOS ORIGINALES)           ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Sin transformación
+agbd.plot_none <- DATA$agbd.plot
+
+cat("Rango de datos:", range(agbd.plot_none, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_none = inla.stack(
+  data = list(agbd = agbd.plot_none),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_none = inla(
+  formula = formula_sqrt,
+  family = 'gaussian',
+  data = inla.stack.data(stack_none),
+  control.predictor = list(A = inla.stack.A(stack_none)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+
+# Diagnóstico PIT
+pit_none <- model_none$cpo$pit[!is.na(model_none$cpo$pit)]
+ks_none <- ks.test(pit_none, "punif")
+
+cat("DIC:", round(model_none$dic$dic, 2), "\n")
+cat("WAIC:", round(model_none$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_none), 4), "\n")
+cat("PIT SD:", round(sd(pit_none), 4), "\n")
+cat("KS p-valor:", format(ks_none$p.value, digits = 4), "\n\n")
+
+# Visualización PIT
+ggplot(data.frame(pit = pit_none), aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#e74c3c", color = "white", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#2c3e50", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  annotate("text", x = 0.5, y = 1.8,
+           label = paste0("NONE | KS p = ", format(ks_none$p.value, digits = 3)),
+           size = 4, fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "PIT Histogram - SIN TRANSFORMACIÓN (Datos Originales)",
+       x = "PIT", y = "Densidad") +
+  theme_bw()
+
+# Guardar modelo
+save(model_none, file = file.path(output_dir, "INLA_model_none.RData"))
+```
+
+---
+
+## 🔬 TRANSFORMACIÓN 5: Raíz Cuarta (FOURTH ROOT)
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# MODELO CON TRANSFORMACIÓN: RAÍZ CUARTA
+# ══════════════════════════════════════════════════════════════════════════════
+
+TRANSFORMACION <- "fourth_root"
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════╗\n")
+cat("║  TRANSFORMACIÓN APLICADA: RAÍZ CUARTA (x^0.25)                 ║\n")
+cat("╚════════════════════════════════════════════════════════════════╝\n")
+
+# Aplicar transformación
+agbd.plot_fourth <- DATA$agbd.plot^0.25
+
+cat("Rango original:", range(DATA$agbd.plot, na.rm = TRUE), "\n")
+cat("Rango transformado:", range(agbd.plot_fourth, na.rm = TRUE), "\n\n")
+
+# Construir modelo
+stack_fourth = inla.stack(
+  data = list(agbd = agbd.plot_fourth),
+  A = list(1, 1, 1, A.plot, Diagonal(x = cci.plot)%*%A.plot, Diagonal(x = hei.plot)%*%A.plot),
+  effects = list(
+    intercept = rep(1, n.plot), cci = cci.plot, hei = hei.plot,
+    alpha.spat = 1:k, beta.spat = 1:k, eta.spat = 1:k
+  )
+)
+
+model_fourth = inla(
+  formula = formula_sqrt,
+  family = 'gaussian',
+  data = inla.stack.data(stack_fourth),
+  control.predictor = list(A = inla.stack.A(stack_fourth)),
+  control.compute = list(config = TRUE, dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = FALSE
+)
+
+# Diagnóstico PIT
+pit_fourth <- model_fourth$cpo$pit[!is.na(model_fourth$cpo$pit)]
+ks_fourth <- ks.test(pit_fourth, "punif")
+
+cat("DIC:", round(model_fourth$dic$dic, 2), "\n")
+cat("WAIC:", round(model_fourth$waic$waic, 2), "\n")
+cat("PIT Media:", round(mean(pit_fourth), 4), "\n")
+cat("PIT SD:", round(sd(pit_fourth), 4), "\n")
+cat("KS p-valor:", format(ks_fourth$p.value, digits = 4), "\n\n")
+
+# Visualización PIT
+ggplot(data.frame(pit = pit_fourth), aes(x = pit)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#9b59b6", color = "white", alpha = 0.8) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  annotate("text", x = 0.5, y = 1.8,
+           label = paste0("FOURTH ROOT | KS p = ", format(ks_fourth$p.value, digits = 3)),
+           size = 4, fontface = "bold") +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "PIT Histogram - Transformación RAÍZ CUARTA",
+       x = "PIT", y = "Densidad") +
+  theme_bw()
+
+# Guardar modelo
+save(model_fourth, file = file.path(output_dir, "INLA_model_fourth.RData"))
+```
+
+---
+
+## 📊 COMPARACIÓN FINAL DE TODAS LAS TRANSFORMACIONES
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# TABLA COMPARATIVA DE MÉTRICAS
+# ══════════════════════════════════════════════════════════════════════════════
+
+library(knitr)
+
+comparacion <- data.frame(
+  Transformacion = c("SQRT", "LOG", "LOG10", "NONE", "FOURTH_ROOT"),
+  DIC = c(
+    round(model_sqrt$dic$dic, 2),
+    round(model_log$dic$dic, 2),
+    round(model_log10$dic$dic, 2),
+    round(model_none$dic$dic, 2),
+    round(model_fourth$dic$dic, 2)
+  ),
+  WAIC = c(
+    round(model_sqrt$waic$waic, 2),
+    round(model_log$waic$waic, 2),
+    round(model_log10$waic$waic, 2),
+    round(model_none$waic$waic, 2),
+    round(model_fourth$waic$waic, 2)
+  ),
+  PIT_Media = c(
+    round(mean(pit_sqrt), 4),
+    round(mean(pit_log), 4),
+    round(mean(pit_log10), 4),
+    round(mean(pit_none), 4),
+    round(mean(pit_fourth), 4)
+  ),
+  PIT_SD = c(
+    round(sd(pit_sqrt), 4),
+    round(sd(pit_log), 4),
+    round(sd(pit_log10), 4),
+    round(sd(pit_none), 4),
+    round(sd(pit_fourth), 4)
+  ),
+  KS_pvalor = c(
+    format(ks_sqrt$p.value, digits = 4),
+    format(ks_log$p.value, digits = 4),
+    format(ks_log10$p.value, digits = 4),
+    format(ks_none$p.value, digits = 4),
+    format(ks_fourth$p.value, digits = 4)
+  )
+)
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════════╗\n")
+cat("║             TABLA COMPARATIVA DE TRANSFORMACIONES                          ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════════╝\n\n")
+
+print(kable(comparacion, format = "markdown", align = "lrrrrr"))
+
+cat("\n")
+cat("NOTAS:\n")
+cat("• Menor DIC/WAIC = Mejor ajuste del modelo\n")
+cat("• PIT Media ideal ≈ 0.5\n")
+cat("• PIT SD ideal ≈ 0.289 (desviación estándar de distribución uniforme)\n")
+cat("• KS p-valor > 0.05 = No se rechaza uniformidad (BUENO)\n")
+cat("\n")
+
+# Identificar mejor modelo
+mejor_dic <- comparacion$Transformacion[which.min(comparacion$DIC)]
+mejor_waic <- comparacion$Transformacion[which.min(comparacion$WAIC)]
+
+cat("═══════════════════════════════════════════════════════════════════════════\n")
+cat("RECOMENDACIÓN:\n")
+cat("• Mejor modelo según DIC:", mejor_dic, "\n")
+cat("• Mejor modelo según WAIC:", mejor_waic, "\n")
+cat("═══════════════════════════════════════════════════════════════════════════\n\n")
+```
+
+---
+
+## 📈 VISUALIZACIÓN COMPARATIVA DE TODOS LOS PITs
+
+```{r}
+# ══════════════════════════════════════════════════════════════════════════════
+# GRÁFICA COMPARATIVA DE TODAS LAS DISTRIBUCIONES PIT
+# ══════════════════════════════════════════════════════════════════════════════
+
+library(ggplot2)
+library(tidyr)
+
+# Combinar todos los PITs en un dataframe
+all_pits <- data.frame(
+  SQRT = pit_sqrt,
+  LOG = pit_log,
+  LOG10 = pit_log10,
+  NONE = pit_none,
+  FOURTH_ROOT = pit_fourth
+)
+
+# Convertir a formato largo para ggplot
+all_pits_long <- pivot_longer(all_pits, cols = everything(),
+                               names_to = "Transformacion", values_to = "PIT")
+
+# Gráfica con facetas
+ggplot(all_pits_long, aes(x = PIT)) +
+  geom_histogram(aes(y = after_stat(density)), breaks = seq(0, 1, by = 0.05),
+                 fill = "#3498db", color = "white", alpha = 0.7) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "#e74c3c", linewidth = 0.8) +
+  geom_density(color = "#2c3e50", linewidth = 1) +
+  facet_wrap(~ Transformacion, ncol = 3) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.5), limits = c(0, 1)) +
+  labs(
+    title = "Comparación de Distribuciones PIT por Transformación",
+    subtitle = "Línea roja punteada = distribución uniforme ideal",
+    x = "PIT (Probability Integral Transform)",
+    y = "Densidad"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 10, hjust = 0.5, color = "grey40"),
+    strip.background = element_rect(fill = "#ecf0f1"),
+    strip.text = element_text(face = "bold", size = 10)
+  )
+
+# Boxplots comparativos
+ggplot(all_pits_long, aes(x = Transformacion, y = PIT, fill = Transformacion)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 21, outlier.size = 1) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "#e74c3c", linewidth = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribución de Valores PIT por Transformación",
+    subtitle = "Línea roja = mediana ideal (0.5)",
+    y = "PIT",
+    x = "Transformación"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold")
+  )
+```
+
+---
+
+```{r}
+### Objetivo Particular: 3. Validar el Modelo (Análisis de Resultados del Primer Modelo)
+
+############################ UNDERSTANDING THE RESULTS OF THE MODEL #######################
+options(repr.plot.width=3, repr.plot.height=3)
+
+# When inla() is executed, we obtain an object of class "inla" that contains the information of the fitted model 
+# including summaries and posterior marginal densities of the fixed effects, 
+# the random effects, and the hyperparameters (and many more things, but we explore only these for now). 
+
+# The fixed effects are straighforward to understand. Below, we see the posterior elements of the intercept alpha, and parameters beta and eta. 
+alpha <- model_fit$marginals.fixed[[1]]
+beta <- model_fit$marginals.fixed[[2]]
+eta <- model_fit$marginals.fixed[[3]]
+ggplot(data.frame(inla.smarginal(alpha)), aes(x, y)) + geom_line() + theme_bw() + xlab("Alpha") + ylab("Density")
+ggplot(data.frame(inla.smarginal(beta)), aes(x, y)) + geom_line() + theme_bw() + xlab("Beta") + ylab("Density")
+ggplot(data.frame(inla.smarginal(eta)), aes(x, y)) + geom_line() + theme_bw() + xlab("Eta") + ylab("Density")
+
+# The random effects, in our case, are also easy to understand from the model outputs. The posterior distributions of the range and SD of alpha.spat, 
+# beta.spat and eta.spat show us how these random effects vary across Mexico.
+
+options(repr.plot.width=10, repr.plot.height=10)
+
+mean_alpha.spat <- model_fit$summary.random[[1]]$mean # mean values of alpha.spat at each mesh vertex
+sd_alpha.spat <- model_fit$summary.random[[1]]$sd # standard deviation of alpha.spat at each mesh node 
+
+mean_beta.spat <- model_fit$summary.random[[2]]$mean # mean values of alpha.spat at each mesh vertex
+sd_beta.spat <- model_fit$summary.random[[2]]$sd # standard deviation of alpha.spat at each mesh node 
+
+mean_eta.spat <- model_fit$summary.random[[3]]$mean # mean values of alpha.spat at each mesh vertex
+sd_eta.spat <- model_fit$summary.random[[3]]$sd # standard deviation of alpha.spat at each mesh node 
+
+ggplot() + coord_sf(crs = 6933) + 
+           geom_point(aes(x = mesh$loc[,1], y = mesh$loc[,2], col = mean_alpha.spat),size=0.5) +  # make a map to see plot locations and the AGBD values at each location
+           scale_color_viridis(option="magma") + xlab("X location of mesh node") + ylab("Y location of mesh node") + ggtitle("Spatial distribution of mean of alpha-tilde") + theme(plot.title = element_text(color="red", size=14, face="bold.italic"))
+
+ggplot() + coord_sf(crs = 6933) + 
+           geom_point(aes(x = mesh$loc[,1], y = mesh$loc[,2], col = mean_beta.spat),size=0.5) +  # make a map to see plot locations and the AGBD values at each location
+           scale_color_viridis(option="magma") + xlab("X location of mesh node") + ylab("Y location of mesh node") + ggtitle("Spatial distribution of mean of beta-tilde") + theme(plot.title = element_text(color="red", size=14, face="bold.italic"))
+
+ggplot() + coord_sf(crs = 6933) + 
+           geom_point(aes(x = mesh$loc[,1], y = mesh$loc[,2], col = mean_eta.spat),size=0.5) +  # make a map to see plot locations and the AGBD values at each location
+           scale_color_viridis(option="magma") + xlab("X location of mesh node") + ylab("Y location of mesh node") + ggtitle("Spatial distribution of mean of eta-tilde") + theme(plot.title = element_text(color="red", size=14, face="bold.italic"))
+
+options(repr.plot.width=4, repr.plot.height=4)
+
+# Let's also plot the corelation vs. distance and covariance vs. distance for alpha.spat to see how the spatial process decays with distance. 
+
+range = model_fit$summary.hyperpar[2,]$mean / 1000 #posterior expected range in kilometers
+dist.seq = 0:600 # and we want a plot for these distance values
+smoothness = 1 # We used the default smoothness of 1 for the Matern Covariance in INLA
+matern.cor.seq = fields::Matern(d = dist.seq, # Compute and plot the correlations
+                                range = range/sqrt(8*smoothness), # This divisor adjusts to the INLA parameterization
+                                smoothness = smoothness)
+plot(dist.seq, matern.cor.seq, xlab = "Distance (km)", ylab = "Correlation",cex=0.5)
+matern.sd = model_fit$summary.hyperpar[3,]$mean # Compute covariance by multiplying by the variance parameter (SD parameter squared)
+plot(dist.seq, matern.cor.seq*matern.sd^2, xlab = "Distance (km)", ylab = "Covariance",cex=0.5)
+
+# DIC, WAIC and the CPO and PIT are standard Bayesian model diagnostics, which tell us how our model is performing. 
+```
+
+### Objetivo Particular: 2. Construir el Modelo (Refinamiento del Modelo con Malla Fina)
+
+### Exploración del Modelo: Refinando la Malla
+
+A continuación, el script refina el modelo. El primer modelo (`model_fit`) se construyó con una malla más gruesa (15 km). Ahora, se construirá un segundo modelo (`model_fit_v2`) con una malla más fina (8 km) para ver si mejora la precisión.
+
+Este es un paso exploratorio común en el modelado geoespacial. El segundo modelo utilizará los resultados del primero como punto de partida para acelerar la convergencia. Todas las predicciones y análisis posteriores se realizarán utilizando este segundo modelo refinado (`model_fit_v2`).
+
+```{r}
+################## IMPROVING OUR MODEL ############
+
+# Before we move ahead, let's try improve our model by making a finer mesh. We choose to rougly half our max.edge (8 km) and see if our model improves. 
+
+max.edge = 8*10^3
+mexico.buffer = st_buffer(mexico, dist = max.edge*5) # We also make a 5 km buffer around Mexico to prevent boundary effects.
+mesh = inla.mesh.2d(boundary = list(as(mexico, "Spatial"), as(mexico.buffer, "Spatial")), max.edge = c(max.edge, 3*max.edge), cutoff = 2*max.edge/3, offset = c(max.edge, 5*max.edge)) 
+k = mesh$n ### This is the resulting number of vertices
+# loc.plot <- data.matrix(loc.plot) #In case loc.plot is a df rather than matrix, use "loc.plot <- data.matrix(loc.plot)"
+A.plot = inla.spde.make.A(mesh = mesh, loc = loc.plot) # make a new projector matrix with the new mesh and the same plot locations. 
+spde.alpha = inla.spde2.pcmatern(mesh, 
+                                 prior.range = c(30*10^3, 0.01), # This says the probability that the range is LESS than 30 km is 0.01
+                                 prior.sigma = c(60, 0.01)) # This says the probability that the sd is GREATER than 60 Mg/ha is 0.01
+
+# Priors for the varying coefficient beta_tilde
+spde.beta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the sd is GREATER than 1 is 0.5
+
+# Priors for the varying coefficient eta_tilde
+spde.eta = inla.spde2.pcmatern(mesh, 
+                                prior.range = c(30*10^3, 0.01), # Same interpretations here
+                                prior.sigma = c(1, 0.5)) # This says the probability that the sd is GREATER than 1 is 0.5
+### Construct our formula #####
+formula = agbd ~
+  -1 + # removes the automatic intercept so you can include your named intercept
+  intercept + 
+  cci +
+  hei +
+  f(alpha.spat, model = spde.alpha) + 
+  f(beta.spat, model = spde.beta) +
+  f(eta.spat, model = spde.eta)
+## Arrange our data so we can supply it to INLA to input in the formula above #####
+stack = inla.stack(data = list(agbd = agbd.plot),
+                   A = list(1, 
+                            1, 
+                            1, 
+                            A.plot, 
+                            Diagonal(x = cci.plot)%*%A.plot, # 
+                            Diagonal(x = hei.plot)%*%A.plot),
+                   effects = list(
+                     intercept = rep(1, n.plot),
+                     cci = cci.plot,
+                     hei = hei.plot,
+                     alpha.spat = 1:k, 
+                     beta.spat = 1:k, 
+                     eta.spat = 1:k
+                   ))
+
+# Below, notice the arguments in 'control.mode = ' We tell INLA our starting parameters in "theta=", but tell it to restart the optimization from 
+# there (restart = T), using the outputs of model_fit generated previously. It will still take a while, but less than it would have if we started from scratch
+
+model_fit_v2 = inla(formula = formula, # Provide the formula
+                 family = 'gaussian', # We assume our data follows a Gaussian generalized linear model (GLM)
+                 data = inla.stack.data(stack), # These line and the one below are simply how we feed INLA the stack.
+                 control.predictor = list(A = inla.stack.A(stack)),
+                 control.compute = list(config = T, dic = T, waic = T, cpo = T),
+                 control.inla = list(int.strategy = "eb"), # EB just fixes the hyperparameters at their maximum posterior (like maximum likelihood, but accounting for priors) values. The other methods manually integrate across the range of possible values.
+                 control.mode = list(theta = model_fit$mode$theta, restart = T), #Ask INLA to restart the model using the previous iteration
+                 verbose = TRUE)
+summary(model_fit_v2)
+
+# Guardar en GMB_MODIFICADO con nombre que incluye la transformación
+model_filename <- paste0("INLA_model_fit_v2_", TRANSFORMACION, ".RData")
+save(model_fit_v2, file = file.path(output_dir, model_filename))
+cat("Modelo guardado en:", file.path(output_dir, model_filename), "\n")
+
+hist(model_fit_v2$cpo$pit, breaks = 20) 
+
+# options(repr.plot.width=4, repr.plot.height=4)
+# load("/projects/ADE_biomass_harmonization/biomass_harmonization/NASA_CMS_2023/Mexico/INLA_model_fit_v2.RData")
+# summary(model_fit_v2)
+# hist(model_fit_v2$cpo$pit, breaks = 20) 
+
+# We don't see a massive improvement in either the PIT distributions, the DIC or WAIC values. 
+# We can conclude that using a max.edge of 8 km is sufficient and there is no further need to refine our mesh. 
+```
+
+
+```{r}
+# --- RECORTAR TRIÁNGULOS DE LA MALLA QUE CAEN EN EL MAR ---
+
+# Convertir nodos de la malla a sf
+mesh_pts <- st_as_sf(
+  data.frame(x = mesh$loc[, 1], y = mesh$loc[, 2]),
+  coords = c("x", "y"),
+  crs = 32616
+)
+
+# Identificar qué nodos están DENTRO del polígono terrestre
+nodos_en_tierra <- st_within(mesh_pts, qroo_proj, sparse = FALSE)[, 1]
+
+# Filtrar triángulos donde LOS 3 VÉRTICES estén en tierra
+tv <- mesh$graph$tv
+
+triangulos_tierra <- apply(tv, 1, function(tri) {
+  all(nodos_en_tierra[tri])
+})
+
+tv_tierra <- tv[triangulos_tierra, ]
+
+# Reconstruir aristas solo con triángulos en tierra
+edges_tierra <- rbind(
+  cbind(tv_tierra[, 1], tv_tierra[, 2]),
+  cbind(tv_tierra[, 2], tv_tierra[, 3]),
+  cbind(tv_tierra[, 1], tv_tierra[, 3])
+)
+
+mesh_df_tierra <- data.frame(
+  x    = mesh$loc[edges_tierra[, 1], 1],
+  y    = mesh$loc[edges_tierra[, 1], 2],
+  xend = mesh$loc[edges_tierra[, 2], 1],
+  yend = mesh$loc[edges_tierra[, 2], 2]
+)
+
+# --- VISUALIZACIÓN RECORTADA ---
+ggplot() +
+  
+  geom_sf(data = qroo_proj, fill = "grey95", color = "grey40", linewidth = 0.5) +
+  
+  # Solo triángulos en tierra
+  geom_segment(data = mesh_df_tierra,
+               aes(x = x, y = y, xend = xend, yend = yend),
+               color = "steelblue", linewidth = 0.2, alpha = 0.7) +
+  
+  geom_point(data = data_for_plot,
+             aes(x = X, y = Y, fill = agbd),
+             shape = 21, size = 2.5, color = "white", stroke = 0.3) +
+  
+  scale_fill_gradientn(
+    colors = c("#ffffcc", "#78c679", "#238443", "#004529"),
+    name   = "Biomasa\n(Mg/ha)"
+  ) +
+  
+  labs(
+    title    = "Malla SPDE — Quintana Roo (sin mar)",
+    subtitle = paste0("Nodos: ", mesh$n, " | Triángulos en tierra: ", sum(triangulos_tierra)),
+    caption  = "Fuente: INFyS - CONAFOR",
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+```
+```{r}
+# --- RECORTAR CON CENTROIDES (más flexible en bordes) ---
+
+# Calcular el centroide de cada triángulo
+centroides <- data.frame(
+  x = (mesh$loc[tv[,1], 1] + mesh$loc[tv[,2], 1] + mesh$loc[tv[,3], 1]) / 3,
+  y = (mesh$loc[tv[,1], 2] + mesh$loc[tv[,2], 2] + mesh$loc[tv[,3], 2]) / 3
+)
+
+centroides_sf <- st_as_sf(centroides, coords = c("x", "y"), crs = 32616)
+
+# Buffer pequeño sobre el polígono terrestre para incluir bordes costeros
+qroo_borde <- st_buffer(qroo_proj, dist = 50) 
+
+# Triángulos cuyo centroide cae dentro del polígono ampliado
+triangulos_validos <- st_within(centroides_sf, qroo_borde, sparse = FALSE)[, 1]
+
+tv_validos <- tv[triangulos_validos, ]
+
+# Reconstruir aristas
+edges_validos <- rbind(
+  cbind(tv_validos[, 1], tv_validos[, 2]),
+  cbind(tv_validos[, 2], tv_validos[, 3]),
+  cbind(tv_validos[, 1], tv_validos[, 3])
+)
+
+mesh_df_validos <- data.frame(
+  x    = mesh$loc[edges_validos[, 1], 1],
+  y    = mesh$loc[edges_validos[, 1], 2],
+  xend = mesh$loc[edges_validos[, 2], 1],
+  yend = mesh$loc[edges_validos[, 2], 2]
+)
+
+# --- VISUALIZACIÓN ---
+ggplot() +
+  
+  geom_sf(data = qroo_proj, fill = "grey95", color = "grey40", linewidth = 0.5) +
+  
+  geom_segment(data = mesh_df_validos,
+               aes(x = x, y = y, xend = xend, yend = yend),
+               color = "steelblue", linewidth = 0.2, alpha = 0.7) +
+  
+  geom_point(data = data_for_plot,
+             aes(x = X, y = Y, fill = agbd),
+             shape = 21, size = 2.5, color = "white", stroke = 0.3) +
+  
+  scale_fill_gradientn(
+    colors = c("#ffffcc", "#78c679", "#238443", "#004529"),
+    name   = "Biomasa\n(Mg/ha)"
+  ) +
+  
+  labs(
+    title    = "Malla SPDE — Quintana Roo",
+    subtitle = paste0("Triángulos: ", sum(triangulos_validos), " | Nodos: ", mesh$n),
+    caption  = "Fuente: INFyS - CONAFOR",
+    x = "Este (m)", y = "Norte (m)"
+  ) +
+  
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "right"
+  )
+```
+
+```{r}
+# --- VERIFICAR TAMAÑOS ANTES DE CONSTRUIR EL STACK ---
+print(paste("Parcelas (n.plot):", length(agbd.plot)))
+print(paste("Nodos del mesh (k):", mesh$n))
+print(paste("Filas de loc.plot:", nrow(loc.plot)))
+
+# --- RECONSTRUIR A.plot CON EL MESH ACTUAL ---
+A.plot <- inla.spde.make.A(mesh = mesh, 
+                            loc  = loc.plot)  # coordenadas UTM de las parcelas
+
+# Verificar dimensiones (deben coincidir)
+print(paste("Dimensiones de A.plot:", nrow(A.plot), "x", ncol(A.plot)))
+print(paste("¿Filas A.plot == n.plot?", nrow(A.plot) == length(agbd.plot)))
+print(paste("¿Columnas A.plot == mesh$n?", ncol(A.plot) == mesh$n))
+
+# Actualizar k
+k <- mesh$n
+
+# --- RECONSTRUIR SPDE ---
+spde.alpha <- inla.spde2.matern(mesh = mesh, alpha = 2)
+spde.beta  <- inla.spde2.matern(mesh = mesh, alpha = 2)
+spde.eta   <- inla.spde2.matern(mesh = mesh, alpha = 2)
+
+# --- STACK CORREGIDO ---
+n.plot <- length(agbd.plot)
+
+stack <- inla.stack(
+  data = list(agbd = agbd.plot),
+  A = list(1,
+           1,
+           1,
+           A.plot,
+           Diagonal(x = cci.plot) %*% A.plot,
+           Diagonal(x = hei.plot) %*% A.plot),
+  effects = list(
+    intercept  = rep(1, n.plot),
+    cci        = cci.plot,
+    hei        = hei.plot,
+    alpha.spat = 1:k,
+    beta.spat  = 1:k,
+    eta.spat   = 1:k
+  )
+)
+```
+
+```{r}
+n.plot <- length(agbd.plot)
+k      <- mesh$n
+
+stack <- inla.stack(
+  data = list(agbd = agbd.plot),
+  A = list(1,
+           1,
+           1,
+           A.plot,
+           Diagonal(x = cci.plot) %*% A.plot,
+           Diagonal(x = hei.plot) %*% A.plot),
+  effects = list(
+    intercept  = rep(1, n.plot),
+    cci        = cci.plot,
+    hei        = hei.plot,
+    alpha.spat = 1:k,
+    beta.spat  = 1:k,
+    eta.spat   = 1:k
+  )
+)
+
+# Verificar que el stack se construyó bien
+print(paste("Stack construido correctamente"))
+print(paste("Filas del stack:", nrow(inla.stack.data(stack)$agbd)))
+```
+
+

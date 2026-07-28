@@ -1,0 +1,499 @@
+---
+title: "Limpieza GLAD"
+author: "Katia M. Villarnobo Gonzalez"
+date: "2026-07-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r cars}
+library(terra)
+library(sf)
+library(tmap)
+library(tmaptools)
+library(ggplot2)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+setwd("C:/Users/katy/Documents/KATY_TESIS_CL/insumos")
+```
+
+
+```{r}
+
+library(terra)
+r <- rast("C:/Users/katy/Documents/KATY_TESIS_CL/insumos/Forest_height_2019_NAM.tif")
+
+# ---- Paleta ----
+verde  <- "#81C784"; blanco <- "white"
+azul   <- "#002F70"; morado <- "#C10781"; rojo <- "#F79CD4"
+fondo  <- "#F7F6F1"
+grid   <- rgb(0.30, 0.30, 0.30, 0.25)
+pal_alturas <- rep(verde, 100); pal_alturas[1] <- blanco
+coltab(r) <- data.frame(
+  value = c(0:99, 101, 102, 103),
+  col   = c(pal_alturas, azul, morado, rojo)
+)
+
+# ---- Geometría del mapa ----
+e      <- ext(r); w <- e[2] - e[1]; h <- e[4] - e[3]
+midlat <- (e[3] + e[4]) / 2
+asp    <- 1 / cos(midlat * pi / 180)
+ratio  <- (h * asp) / w
+
+# ---- Ventana proporcional al mapa + espacio para título ----
+dev.new(width = 8.5, height = 8.5 * ratio * (8/9) + 1.2,
+        unit = "in", noRStudioGD = TRUE)
+
+par(family = "serif", fg = "grey30", col.axis = "grey40",
+    cex.axis = 0.65, mar = c(3, 3.5, 3.8, 1.5))
+
+# 1) Base: fija coordenadas y proporción
+plot.new()
+plot.window(xlim = c(e[1], e[2]), ylim = c(e[3], e[4]),
+            asp = asp, xaxs = "i", yaxs = "i")
+
+# 2) Fondo del panel — solo el área del tiff
+rect(e[1], e[3], e[2], e[4], col = fondo, border = NA)
+
+# 3) Raster
+plot(r, legend = FALSE, add = TRUE)
+
+# 4) Retícula encima del raster, recortada al área del tiff
+xg <- pretty(c(e[1], e[2]), 6); xg <- xg[xg > e[1] & xg < e[2]]
+yg <- pretty(c(e[3], e[4]), 6); yg <- yg[yg > e[3] & yg < e[4]]
+segments(xg, e[3], xg, e[4], col = grid, lwd = 0.5)
+segments(e[1], yg, e[2], yg, col = grid, lwd = 0.5)
+
+# 5) Ejes finos y marco ajustado exactamente al tiff
+axis(1, at = xg, col = "grey75", col.ticks = "grey60", tck = -0.012)
+axis(2, at = yg, col = "grey75", col.ticks = "grey60", tck = -0.012, las = 1)
+rect(e[1], e[3], e[2], e[4], col = NA, border = "grey70", lwd = 0.8)
+
+
+# 7) Escala y norte
+sbar(1000, xy = c(e[1] + 0.05 * w, e[3] + 0.06 * h),
+     type = "bar", divs = 4, below = "km", cex = 0.6, lonlat = TRUE)
+north(xy = c(e[2] - 0.07 * w, e[3] + 0.10 * h), type = 2, cex = 0.8)
+
+# 8) Leyenda — fondo transparente, título centrado, borde superior en latitud 50
+legend(x = e[1] + 0.02 * w, y = 50,
+       title  = "Clase",
+       legend = c("Sin vegetación", "Vegetación", "101-> Agua", "102 ->hielo", "103 ->NAN"),
+       fill   = c(blanco, verde, azul, morado, rojo),
+       border = "grey55",
+       bg = rgb(1, 1, 1, 0.4),   # blanco semitransparente (baja a 0.2 o sube a 0.6 a gusto)
+       box.col = "grey70",
+       cex = 0.72, y.intersp = 1.25,
+       text.col = "grey25",
+       title.col = "grey15", title.font = 2,
+       title.adj = 0.5,
+       xpd = TRUE)
+
+```
+
+```{r}
+
+
+# ---- Muestra en vez de cargar todo ----
+set.seed(1)
+vals <- spatSample(r, size = 2e6, method = "regular",
+                   na.rm = TRUE, values = TRUE)[, 1]
+
+# Conteo por valor (0–103) sobre la muestra ----
+h <- hist(vals, breaks = 0:104 - 0.5, plot = FALSE)   # un bin por valor entero
+val <- round(h$mids)
+cnt <- h$counts
+keep <- cnt > 0
+val <- val[keep]; cnt <- cnt[keep]
+
+# Colores por clase (mismos del mapa)
+verde <- "#81C784"; azul <- "#002F70"; morado <- "#C10781"; rosa <- "#F79CD4"
+fondo <- "#F7F6F1"; grid <- rgb(0.30, 0.30, 0.30, 0.25)
+
+cols <- rep(verde, length(val))
+cols[val == 0]   <- "grey70"
+cols[val == 101] <- azul
+cols[val == 102] <- morado
+cols[val == 103] <- rosa
+
+#  Ventana 
+dev.new(width = 9, height = 5, unit = "in", noRStudioGD = TRUE)
+par(family = "serif", fg = "grey30", col.axis = "grey45",
+    col.lab = "grey30", cex.axis = 0.7, cex.lab = 0.9,
+    mar = c(4, 4.8, 2.5, 1.2))
+
+# ---- Escala log en Y ----
+ylim <- c(0.7, max(cnt) * 1.3)
+bp <- barplot(cnt, log = "y", ylim = ylim, names.arg = val,
+              col = cols, border = "grey45", space = 0.2,
+              axes = FALSE, las = 2, cex.names = 0.5)
+
+# fondo + retícula
+u <- par("usr")
+rect(u[1], 10^u[3], u[2], 10^u[4], col = fondo, border = NA)
+yticks <- 10^(0:ceiling(log10(max(cnt))))
+abline(h = yticks, col = grid, lwd = 0.5)
+barplot(cnt, log = "y", ylim = ylim, col = cols, border = "grey45",
+        space = 0.2, axes = FALSE, add = TRUE)
+
+# eje Y
+axis(2, at = yticks, labels = format(yticks, big.mark = ",", scientific = FALSE),
+     col = "grey80", col.ticks = "grey65", tck = -0.015, mgp = c(2, 0.5, 0), las = 1)
+box(col = "grey70", lwd = 0.8)
+
+# etiquetas y leyenda
+mtext("Valor del píxel (altura en m · códigos 101–103)", side = 1, line = 2.6,
+      cex = 0.9, col = "grey30")
+mtext("Número de píxeles (escala log)", side = 2, line = 3.6,
+      cex = 0.9, col = "grey30")
+
+legend("topright",
+       legend = c("Sin vegetación (0)", "Vegetación (1–99)",
+                  "101 · Agua", "102 · Hielo", "103 · NA"),
+       fill = c("grey70", verde, azul, morado, rosa),
+       border = "grey55", bg = rgb(1,1,1,0.6), box.col = "grey70",
+       cex = 0.7, y.intersp = 1.15)
+```
+```{r}
+library(sf)
+library(terra)
+
+# ---- Recorte de Quintana Roo ----
+mexico <- st_read("C:/Users/katy/Documents/KATY_TESIS_CL/insumos/QuintanaRoo_Entidad_MOD.gpkg",
+                  quiet = TRUE) |>
+  st_union() |> st_transform(crs = 32616)
+hei.rast <- rast("C:/Users/katy/Documents/KATY_TESIS_CL/productos/Forest_height_QROO.tif")
+lim <- project(vect(mexico), crs(hei.rast))
+r   <- crop(hei.rast, ext(lim))
+
+# ---- Paleta / simbología ----
+verde  <- "#81C784"; blanco <- "white"
+azul   <- "#002F70"; morado <- "#C10781"; rojo <- "#F79CD4"
+fondo  <- "#F7F6F1"
+grid   <- rgb(0.30, 0.30, 0.30, 0.25)
+pal_alturas <- rep(verde, 100); pal_alturas[1] <- blanco
+coltab(r) <- data.frame(
+  value = c(0:99, 101, 102, 103),
+  col   = c(pal_alturas, azul, morado, rojo)
+)
+
+# ---- Geometría ----
+e   <- ext(r); w <- e[2] - e[1]; h <- e[4] - e[3]
+lonlat <- is.lonlat(r)
+asp    <- if (lonlat) 1 / cos(((e[3]+e[4])/2) * pi/180) else 1
+ratio  <- (h * asp) / w
+
+# ---- Ventana ----
+dev.new(width = 8, height = 8 * ratio + 0.4, unit = "in", noRStudioGD = TRUE)
+par(family = "serif", fg = "grey30", col.axis = "grey45",
+    cex.axis = 0.6, mar = c(1.4, 1.4, 0.6, 1))
+
+# 1) Base
+plot.new()
+plot.window(xlim = c(e[1], e[2]), ylim = c(e[3], e[4]),
+            asp = asp, xaxs = "i", yaxs = "i")
+
+# 2) Fondo
+rect(e[1], e[3], e[2], e[4], col = fondo, border = NA)
+
+# 3) Raster
+plot(r, legend = FALSE, add = TRUE)
+
+# 4) Retícula
+xg <- pretty(c(e[1], e[2]), 4); xg <- xg[xg > e[1] & xg < e[2]]
+yg <- pretty(c(e[3], e[4]), 4); yg <- yg[yg > e[3] & yg < e[4]]
+segments(xg, e[3], xg, e[4], col = grid, lwd = 0.4)
+segments(e[1], yg, e[2], yg, col = grid, lwd = 0.4)
+
+# 5) Ejes — X pegado; Y con etiquetas adentro, corridas un poco a la izquierda
+axis(1, at = xg, labels = format(round(xg), big.mark = ""),
+     col = "grey80", col.ticks = "grey65", tck = -0.010, mgp = c(2, 0, 0))
+
+axis(2, at = yg, labels = FALSE, lwd = 0, lwd.ticks = 1,
+     col.ticks = "grey65", tck = -0.010)
+text(x = e[1], y = yg, labels = format(round(yg), big.mark = ""),
+     pos = 2, offset = 0.1, cex = 0.6, col = "grey45", xpd = TRUE)   # pos = 2 = a la izquierda
+
+rect(e[1], e[3], e[2], e[4], col = NA, border = "grey70", lwd = 0.8)
+
+# 6) Escala y norte
+dist <- if (lonlat) 50 else 50000
+sbar(dist, xy = c(e[1] + 0.05 * w, e[3] + 0.05 * h),
+     type = "bar", divs = 4, below = "km", cex = 0.55, lonlat = lonlat)
+north(xy = c(e[2] - 0.08 * w, e[3] + 0.11 * h), type = 2, cex = 0.7)
+
+# 7) Leyenda compacta
+legend(x = e[1] + 0.03 * w, y = e[4] - 0.03 * h,
+       title  = "Clase",
+       legend = c("Sin vegetación", "Vegetación", "Agua", "Hielo", "NA"),
+       fill   = c(blanco, verde, azul, morado, rojo),
+       border = "grey60",
+       bg = rgb(1, 1, 1, 0.45), box.col = "grey75",
+       cex = 0.6, y.intersp = 1.0, pt.cex = 0.9,
+       text.col = "grey25",
+       title.col = "grey15", title.font = 2,
+       title.adj = 0.5, xpd = TRUE)
+```
+
+```{r}
+# ---- Histograma de TODOS los valores (usa el 'r' recortado de arriba) ----
+
+# Conteo exacto por valor, sin agotar memoria
+f <- freq(r)
+f <- f[f$count > 0, ]
+f <- f[order(f$value), ]
+
+# Colores por clase 
+verde <- "#81C784"; blanco <- "white"
+azul  <- "#002F70"; morado <- "#C10781"; rosa <- "#F79CD4"
+fondo <- "#F7F6F1"; grid <- rgb(0.30, 0.30, 0.30, 0.25)
+
+cols <- rep(verde, nrow(f))
+cols[f$value == 0]   <- "grey70"     # 0 gris para que se vea sobre blanco
+cols[f$value == 101] <- azul
+cols[f$value == 102] <- morado
+cols[f$value == 103] <- rosa
+
+# Ventana 
+dev.new(width = 9, height = 5, unit = "in", noRStudioGD = TRUE)
+par(family = "serif", fg = "grey30", col.axis = "grey45",
+    col.lab = "grey30", cex.axis = 0.7, cex.lab = 0.9,
+    mar = c(4, 4.8, 2.5, 1.2))
+
+# Escala log en Y
+ylim <- c(0.7, max(f$count) * 1.3)
+bp <- barplot(f$count, log = "y", ylim = ylim, names.arg = f$value,
+              col = cols, border = "grey45", space = 0.2,
+              axes = FALSE, las = 2, cex.names = 0.5)
+
+# fondo + retícula
+u <- par("usr")
+rect(u[1], 10^u[3], u[2], 10^u[4], col = fondo, border = NA)
+yticks <- 10^(0:ceiling(log10(max(f$count))))
+abline(h = yticks, col = grid, lwd = 0.5)
+barplot(f$count, log = "y", ylim = ylim, col = cols, border = "grey45",
+        space = 0.2, axes = FALSE, add = TRUE)   # redibuja barras sobre la retícula
+
+# eje Y
+axis(2, at = yticks, labels = format(yticks, big.mark = ",", scientific = FALSE),
+     col = "grey80", col.ticks = "grey65", tck = -0.015, mgp = c(2, 0.5, 0), las = 1)
+box(col = "grey70", lwd = 0.8)
+
+# etiquetas y leyenda
+mtext("Valor del píxel (altura en m · códigos 101–103)", side = 1, line = 2.6,
+      cex = 0.9, col = "grey30")
+mtext("Número de píxeles (escala log)", side = 2, line = 3.6, cex = 0.9, col = "grey30")
+
+legend("topright",
+       legend = c("Sin vegetación (0)", "Vegetación (1–99)",
+                  "101 · Agua", "102 · Hielo", "103 · NA"),
+       fill = c("grey70", verde, azul, morado, rosa),
+       border = "grey55", bg = rgb(1,1,1,0.6), box.col = "grey70",
+       cex = 0.7, y.intersp = 1.15)
+```
+
+```{r}
+# Recortar y enmascarar al área de Quintana Roo
+
+hei_clip <- mask(crop(hei.rast, lim), lim)
+
+hei_clean <- ifel(hei_clip <= 0 | hei_clip >= 101, NA, hei_clip)
+summary(hei_clean)
+```
+```{r}
+# MAPA DE ALTURA (DATOS EN CRUDO)
+
+
+ggplot() +
+  geom_spatraster(data = hei_clip) +
+  geom_sf(data = mexico, fill = NA, color = "black", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Valor de pixel",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Altura de Vegetación GLAD (Máscara)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text = element_text(size = 9)
+  )
+```
+
+
+```{r}
+library(ggplot2)
+library(sf)
+library(terra)
+library(tidyterra)   
+
+# MAPA DE ALTURA (DATOS LIMPIOS)
+
+ggplot() +
+  geom_spatraster(data = hei_clean) +
+  geom_sf(data = mexico, fill = NA, color = "red", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Altura\n(m)",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Altura de Vegetación GLAD (Datos Limpios)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud", y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text  = element_text(size = 9)
+  )
+```
+
+```{r}
+# Histograma de datos limpios (hei_clean) 
+library(viridisLite)
+
+alturas <- values(hei_clean, mat = FALSE)
+alturas <- alturas[!is.na(alturas)]
+
+fondo <- "white"; grid <- "gray90"   # fondo blanco + retícula tenue, como theme_minimal
+
+dev.new(width = 7, height = 5, unit = "in", noRStudioGD = TRUE)
+par(family = "serif", fg = "grey30", col.axis = "grey45",
+    col.lab = "grey30", cex.axis = 0.75, cex.lab = 0.9,
+    mar = c(4, 4.8, 2.5, 1.2))
+
+h <- hist(alturas, breaks = 40, plot = FALSE)
+
+# color viridis según la altura del centro de cada barra
+rng     <- range(alturas)
+pos     <- (h$mids - rng[1]) / (rng[2] - rng[1])
+col_bar <- viridis(100)[pmax(1, ceiling(pos * 100))]
+
+plot.new()
+plot.window(xlim = range(h$breaks), ylim = c(0, max(h$counts) * 1.04),
+            xaxs = "i", yaxs = "i")
+
+# fondo + retícula horizontal
+u <- par("usr"); rect(u[1], u[3], u[2], u[4], col = fondo, border = NA)
+yg <- pretty(c(0, max(h$counts)), 6)
+abline(h = yg, col = grid, lwd = 0.6)
+
+# barras coloreadas con viridis
+rect(h$breaks[-length(h$breaks)], 0, h$breaks[-1], h$counts,
+     col = col_bar, border = "grey40", lwd = 0.4)
+
+# media (etiqueta a la IZQUIERDA de la línea)
+m <- mean(alturas)
+abline(v = m, col = "#CF4436", lwd = 1.5, lty = 2)
+text(m, max(h$counts) * 0.95,
+     sprintf("media = %.1f m", m),
+     col = "#CF4436", pos = 2, cex = 0.75)      # pos = 2 = a la izquierda
+
+# ejes
+axis(1, col = "grey80", col.ticks = "grey65", tck = -0.015, mgp = c(2, 0.4, 0))
+axis(2, at = yg, labels = format(yg, big.mark = ",", scientific = FALSE),
+     col = "grey80", col.ticks = "grey65", tck = -0.015, mgp = c(2, 0.5, 0), las = 1)
+box(col = "grey70", lwd = 0.8)
+
+# etiquetas
+mtext("Altura del dosel (m)", side = 1, line = 2.4, cex = 0.9, col = "grey30")
+mtext("Número de píxeles",     side = 2, line = 3.6, cex = 0.9, col = "grey30")
+```
+```{r}
+library(terra)
+
+# MÉTRICAS DE LIMPIEZA - ALTURA GLAD
+
+
+# Raster completo ANTES del mask 
+hei_original_temp      <- rast("../productos/Forest_height_QROO.tif")
+hei_original_proj_temp <- project(hei_original_temp, crs(lim))   
+val_completo <- values(hei_original_proj_temp, mat = FALSE)      
+
+# Valores DENTRO del continente (después del mask)
+val_crudo  <- values(hei_clip,  na.rm = TRUE)   
+val_limpio <- values(hei_clean, na.rm = TRUE) 
+
+# Conteos base 
+n_total      <- ncell(hei_original_proj_temp)
+n_na_crudo   <- sum(is.na(values(hei_clip, mat = FALSE)))   
+n_validos_crudo  <- length(val_crudo)
+n_validos_limpio <- length(val_limpio)
+#  Agua 
+agua_101_continente <- sum(val_crudo == 101, na.rm = TRUE)   
+agua_oceano         <- n_na_crudo                           
+agua_total          <- agua_oceano + agua_101_continente
+
+#Píxeles <= 0 (océano vs continente) -
+ceros_total      <- sum(val_completo <= 0, na.rm = TRUE)
+ceros_continente <- sum(val_crudo    <= 0, na.rm = TRUE)
+ceros_oceano     <- ceros_total - ceros_continente
+
+# Eliminados por limpieza 
+eliminados       <- n_validos_crudo - n_validos_limpio
+pct_eliminado    <- eliminados / n_validos_crudo * 100
+pct_ceros_oceano     <- ceros_oceano     / ceros_total * 100
+pct_ceros_continente <- ceros_continente / ceros_total * 100
+
+###################################################################
+# REPORTE
+
+cat("\n========================================\n")
+cat("MÉTRICAS DE LIMPIEZA - ALTURA GLAD\n")
+cat("========================================\n\n")
+cat("Total de píxeles en el raster:", format(n_total, big.mark = ","), "\n")
+
+cat("\nDATOS EN CRUDO (hei_clip):\n")
+cat("  - Píxeles NA (océano/fuera de máscara):", format(n_na_crudo, big.mark = ","), "\n")
+cat("  - Píxeles agua interior (101):         ", format(agua_101_continente, big.mark = ","), "\n")
+cat("  - Total píxeles de agua (NA + 101):    ", format(agua_total, big.mark = ","), "\n")
+cat("  - Píxeles con valores:                 ", format(n_validos_crudo, big.mark = ","), "\n")
+
+cat("\nDATOS LIMPIOS (hei_clean):\n")
+cat("  - Píxeles válidos (1-100 m):", format(n_validos_limpio, big.mark = ","), "\n")
+
+cat("\nRESULTADOS DE LIMPIEZA:\n")
+cat("  - Píxeles eliminados (<=0 y 101):", format(eliminados, big.mark = ","), "\n")
+cat("  - Porcentaje eliminado:", round(pct_eliminado, 2), "%\n")
+cat("  - Porcentaje retenido:", round(100 - pct_eliminado, 2), "%\n")
+
+cat("\n========================================\n")
+cat("ANÁLISIS DE PÍXELES <=0 (OCÉANO vs CONTINENTE)\n")
+cat("========================================\n\n")
+cat("Total píxeles <=0 en raster completo:", format(ceros_total, big.mark = ","), "\n")
+cat("  - En OCÉANO (fuera de máscara):", format(ceros_oceano, big.mark = ","),
+    "(", round(pct_ceros_oceano, 2), "%)\n")
+cat("  - En CONTINENTE (dentro de máscara):", format(ceros_continente, big.mark = ","),
+    "(", round(pct_ceros_continente, 2), "%)\n")
+
+cat("\n========================================\n")
+cat("ESTADÍSTICAS DE VALORES\n")
+cat("========================================\n")
+cat("\n--- DATOS EN CRUDO (dentro del continente) ---\n")
+print(summary(val_crudo))
+cat("\n--- DATOS LIMPIOS (1-100 m) ---\n")
+print(summary(val_limpio))
+cat("\n========================================\n")
+```
+

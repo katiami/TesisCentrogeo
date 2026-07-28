@@ -1,0 +1,56 @@
+# R y RStudio
+.Rhistory
+.RData
+.RDataTmp
+.RDataTmp1
+.Rproj.user
+.Rproj
+*.Rproj
+*.RData
+.httr-oauth
+
+# Archivos temporales de R
+*.rds
+*.RDS
+*_cache/
+/cache
+*.nb.html
+*.html
+
+# Archivos de backup
+*~
+*.bak
+*.tmp
+*_backup.Rmd
+*_backup.*
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archivos grandes de datos (personaliza según necesites)
+*.tif
+*.tiff
+*.nc
+*.hdf
+*.h5
+
+# Python (si usas)
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Archivos de entorno
+.env
+.venv
+env/
+venv/
+
+# Logs
+*.log
+
+# Carpetas de salida (ajusta según tu proyecto)
+/output/
+/temp/

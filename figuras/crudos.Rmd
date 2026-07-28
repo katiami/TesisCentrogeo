@@ -1,0 +1,115 @@
+````r
+---
+title: "Mapa de Altura Forestal GLAD - Quintana Roo"
+author: "Katy"
+output: html_notebook
+---
+
+# Librerías
+
+```{r message=FALSE, warning=FALSE}
+library(terra)
+library(sf)
+library(tmap)
+library(tmaptools)
+library(ggplot2)
+```
+
+# Definir directorio de trabajo
+
+```{r}
+setwd("C:/Users/katy/Documents/KATY_TESIS_CL/insumos")
+```
+
+# Cargar raster GLAD
+
+**IMPORTANTE:** Cambia la extensión si tu archivo no es .tif
+
+```{r}
+raster_glad <- rast("Forest_height_2019_NAM.tif")
+
+raster_glad
+plot(raster_glad)
+```
+
+
+
+# Sistema de referencia
+
+```{r}
+crs(raster_glad)
+```
+
+# Crear mapa cartográfico
+
+```{r}
+install.packages("tmap")   # solo si no está instalado
+library(tmap)
+tmap_mode("plot")
+
+mapa_glad <-
+
+tm_shape(raster_glad) +
+
+tm_raster(
+  palette = "-YlGn",
+  title = "Altura forestal (m)",
+  style = "cont"
+) +
+
+tm_layout(
+  title = "Altura Forestal GLAD - Quintana Roo",
+  title.size = 1.2,
+  legend.outside = TRUE,
+  legend.outside.position = "right",
+  frame = TRUE,
+  bg.color = "white"
+) +
+
+tm_compass(
+  type = "8star",
+  position = c("left","top"),
+  size = 2
+) +
+
+tm_scale_bar(
+  position = c("left","bottom"),
+  text.size = 0.8
+) +
+
+tm_credits(
+  text = paste(
+    "Fuente: GLAD Forest Height",
+    "\nElaboración propia",
+    "\nSistema de referencia:",
+    crs(raster_glad)
+  ),
+  position = c("RIGHT","BOTTOM"),
+  size = 0.6
+)
+
+mapa_glad
+```
+
+# Guardar mapa
+
+```{r}
+tmap_save(
+  mapa_glad,
+  filename = "Mapa_GLAD_Altura_Forestal_QROO.png",
+  width = 10,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+```
+
+# Histograma de valores
+
+```{r}
+hist(values(raster_glad),
+     main = "Distribución de Altura Forestal",
+     xlab = "Altura (m)",
+     col = "forestgreen",
+     border = "white")
+```

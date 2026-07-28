@@ -1,0 +1,1202 @@
+---
+title: "Regresión: Predicción de Biomasa usando Embeddings"
+author: "Análisis de Tesis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 6)
+```
+
+# 1. Introducción
+
+Este notebook realiza una **regresión lineal** para predecir la biomasa aérea total por conglomerado utilizando embeddings como variables predictoras.
+
+## Contexto
+
+**Embeddings AlphaEarth (Google):**
+Los embeddings fueron extraídos usando Google Earth Engine con un buffer de 56.42m de radio (aproximadamente 1 hectárea) alrededor del centro de cada conglomerado. Estos embeddings capturan características espectrales y de textura del paisaje que reflejan la estructura de la vegetación, cobertura forestal, y condiciones del sitio.
+
+**Inventario Forestal Nacional (INFyS):**
+Los datos de biomasa provienen de mediciones de árboles individuales en 4 sitios circulares de 0.04 ha cada uno (total 0.16 ha muestreadas por conglomerado). La biomasa individual se calcula a partir del diámetro y altura de cada árbol usando ecuaciones alométricas específicas por especie.
+
+**Normalización de Escala Espacial:**
+Para que las escalas espaciales sean comparables, la biomasa se extrapola de las 0.16 ha muestreadas a Mg/ha, igualando la escala del paisaje que capturan los embeddings (aproximadamente 1 ha).
+
+## Flujo de Trabajo
+
+1. **Carga de Datos**
+   - Cargar embeddings de AlphaEarth (1 fila por conglomerado)
+   - Cargar inventario forestal INFyS (múltiples árboles por conglomerado)
+   - Estandarizar nombres de columnas (IdConglomerado)
+
+2. **Preparación de Datos**
+   - Agregar biomasa individual a nivel de conglomerado (suma de todos los árboles)
+   - Convertir de kg a Mg/ha (dividir entre 1000 y 0.16 ha)
+   - Unir biomasa agregada con embeddings (JOIN 1:1 por IdConglomerado)
+
+3. **Extracción de Variables**
+   - Variable respuesta: biomasa_Mg_ha
+   - Predictores: 128 embeddings (z00-z63, v00-v63)
+   - Verificación de varianza y valores faltantes
+
+4. **Modelado**
+   - División train-test (80-20)
+   - Ajuste de modelo de regresión lineal múltiple
+   - Predicción en conjunto de prueba
+
+5. **Evaluación**
+   - Cálculo de métricas: R², RMSE, MAE, MAPE
+   - Análisis de residuos
+   - Visualización de predicciones vs valores reales
+   - Identificación de variables más importantes
+
+## Objetivo
+
+Evaluar si los embeddings de paisaje (AlphaEarth) pueden predecir la biomasa agregada por conglomerado medida en campo.
+
+**Variables:**
+- **Variable respuesta:** Biomasa por conglomerado (Mg/ha) - extrapolada de área muestreada
+- **Predictores:** 128 embeddings de paisaje por conglomerado (z00-z63 = medias, v00-v63 = varianzas)
+
+---
+
+# 2. Carga de Datos
+
+```{r load_data}
+library(sf)
+library(dplyr)
+
+# Rutas de los archivos
+embeddings_path <- "embeddings_infys_2.csv"
+inf_path <- "C:/Users/katy/Documents/KATY_TESIS_CL/insumos/INF_WGS84.gpkg"
+
+# Cargar embeddings (1 fila por conglomerado)
+cat("Cargando embeddings desde:", embeddings_path, "\n")
+embeddings_raw <- read.csv(embeddings_path)
+
+# Cargar inventario forestal individual
+cat("Cargando inventario forestal individual desde:", inf_path, "\n")
+nfi_raw <- st_read(inf_path, quiet = TRUE) %>% st_drop_geometry()
+
+# Mostrar dimensiones originales
+cat("\n=== DATOS ORIGINALES ===\n")
+cat("Embeddings (nivel conglomerado):", dim(embeddings_raw), "\n")
+cat("INF (árboles individuales):", dim(nfi_raw), "\n")
+
+# PASO 1: Estandarizar nombres de columnas
+# Google Earth Engine trunca los nombres largos, por lo que IdConglomerado puede aparecer como IdConglome
+cat("\n=== ESTANDARIZACIÓN DE NOMBRES ===\n")
+
+# Buscar la columna de ID en embeddings (puede estar truncada)
+id_cols_embeddings <- grep("^IdConglom", names(embeddings_raw), value = TRUE, ignore.case = TRUE)
+if(length(id_cols_embeddings) > 0) {
+  old_name <- id_cols_embeddings[1]
+  cat("Embeddings - Renombrando:", old_name, "a IdConglomerado\n")
+  embeddings_raw <- embeddings_raw %>%
+    rename(IdConglomerado = !!old_name)
+} else {
+  cat("ADVERTENCIA: Embeddings - No se encontró columna de ID\n")
+  cat("Columnas disponibles:", paste(head(names(embeddings_raw), 10), collapse = ", "), "...\n")
+  stop("No se encontró columna de ID en embeddings")
+}
+
+# Verificar y estandarizar columna de ID en INF si es necesario
+id_cols_nfi <- grep("^IdConglom", names(nfi_raw), value = TRUE, ignore.case = TRUE)
+if(length(id_cols_nfi) > 0 && id_cols_nfi[1] != "IdConglomerado") {
+  old_name_nfi <- id_cols_nfi[1]
+  cat("INF - Renombrando:", old_name_nfi, "a IdConglomerado\n")
+  nfi_raw <- nfi_raw %>%
+    rename(IdConglomerado = !!old_name_nfi)
+}
+
+# PASO 2: Verificar estructura de los datos cargados
+cat("\n=== ESTRUCTURA DE DATOS ===\n")
+if("IdConglomerado" %in% names(nfi_raw)) {
+  cat("INF - IdConglomerado encontrado\n")
+  cat("  - Conglomerados únicos:", length(unique(nfi_raw$IdConglomerado)), "\n")
+  cat("  - Árboles totales:", nrow(nfi_raw), "\n")
+  cat("  - Promedio árboles/conglomerado:", round(nrow(nfi_raw) / length(unique(nfi_raw$IdConglomerado)), 2), "\n")
+}
+
+if("IdConglomerado" %in% names(embeddings_raw)) {
+  cat("\nEmbeddings - IdConglomerado encontrado\n")
+  cat("  - Conglomerados con embeddings:", nrow(embeddings_raw), "\n")
+}
+
+# PASO 3: Verificar presencia de biomasa individual
+if("biomasa_kg_C3" %in% names(nfi_raw)) {
+  cat("\nBiomasa individual (biomasa_kg_C3) encontrada\n")
+  cat("  - Rango: [", round(min(nfi_raw$biomasa_kg_C3, na.rm = TRUE), 2), ",",
+      round(max(nfi_raw$biomasa_kg_C3, na.rm = TRUE), 2), "] kg\n", sep = "")
+  cat("  - Valores NA:", sum(is.na(nfi_raw$biomasa_kg_C3)), "\n")
+}
+
+# PASO 4: Verificación de varianza en embeddings crudos
+# Importante: Los embeddings deben tener varianza para ser útiles en el modelo
+numeric_cols_emb <- names(embeddings_raw)[sapply(embeddings_raw, is.numeric)]
+if(length(numeric_cols_emb) > 0) {
+  test_var_col <- numeric_cols_emb[!numeric_cols_emb %in% c("IdConglomerado")][1]
+  if(!is.null(test_var_col)) {
+    cat("\n--- Verificación de Varianza en Embeddings ---\n")
+    cat("Columna de prueba:", test_var_col, "\n")
+    cat("Varianza:", var(embeddings_raw[[test_var_col]], na.rm = TRUE), "\n")
+    cat("Valores únicos:", length(unique(embeddings_raw[[test_var_col]])), "\n")
+  }
+}
+```
+
+---
+
+# 3. Preparación de Datos
+
+## 3.1 Agregar Biomasa por Conglomerado
+
+```{r aggregate_biomass}
+cat("\n")
+cat("========================================================================\n")
+cat("  ESTRATEGIA: BIOMASA AGREGADA POR CONGLOMERADO                        \n")
+cat("                                                                        \n")
+cat("  Problema de granularidad:                                            \n")
+cat("  - INF: Múltiples árboles por conglomerado (datos individuales)       \n")
+cat("  - Embeddings: 1 fila por conglomerado (paisaje 56.42m buffer)        \n")
+cat("                                                                        \n")
+cat("  Solución:                                                             \n")
+cat("  1. SUMAR biomasa_kg_C3 de todos los árboles por IdConglomerado       \n")
+cat("  2. Convertir kg a Mg/ha (dividir entre 1000 y 0.16 ha)               \n")
+cat("  3. JOIN 1:1 entre biomasa agregada y embeddings                      \n")
+cat("========================================================================\n")
+cat("\n")
+
+cat("=== PASO 1: AGREGACIÓN DE BIOMASA POR CONGLOMERADO ===\n")
+
+# Filtrar valores válidos (eliminar NA y ceros) y agrupar por conglomerado
+nfi_agregado <- nfi_raw %>%
+  filter(!is.na(biomasa_kg_C3), biomasa_kg_C3 > 0) %>%
+  group_by(IdConglomerado) %>%
+  summarise(
+    n_arboles = n(),                                         # Contador de árboles
+    biomasa_kg_total = sum(biomasa_kg_C3, na.rm = TRUE),     # Suma kg de todos los árboles
+    biomasa_Mg_ha = biomasa_kg_total / 1000 / 0.16,          # Conversión: kg a Mg, luego a Mg/ha
+    .groups = 'drop'
+  )
+
+cat("\nBiomasa agregada exitosamente\n")
+cat("  - Conglomerados en INF:", nrow(nfi_agregado), "\n")
+cat("  - Total de árboles procesados:", sum(nfi_agregado$n_arboles), "\n")
+cat("  - Promedio árboles/conglomerado:", round(mean(nfi_agregado$n_arboles), 2), "\n")
+
+# Explicación del escalamiento espacial
+cat("\nEscalamiento de biomasa a Mg/ha:\n")
+cat("  - Área muestreada: 4 sitios de 0.04 ha = 0.16 ha por conglomerado\n")
+cat("  - Área de embeddings: buffer de 56.42m de radio = aprox. 1 ha\n")
+cat("  - Razón: La biomasa se extrapola a Mg/ha para igualar la escala espacial\n")
+cat("  - Rango de biomasa: [", round(min(nfi_agregado$biomasa_Mg_ha), 2), ",",
+    round(max(nfi_agregado$biomasa_Mg_ha), 2), "] Mg/ha\n", sep = "")
+
+cat("\n--- Estadísticas de biomasa agregada (Mg/ha) ---\n")
+summary(nfi_agregado$biomasa_Mg_ha)
+
+cat("\n=== PASO 2: JOIN CON EMBEDDINGS (1:1) ===\n")
+
+# Unir biomasa agregada con embeddings por IdConglomerado
+# Este es un JOIN 1:1 porque ambos datasets tienen 1 fila por conglomerado
+datos_unidos <- nfi_agregado %>%
+  inner_join(embeddings_raw, by = "IdConglomerado")
+
+cat("\nJOIN completado\n")
+cat("  - Conglomerados en INF agregado:", nrow(nfi_agregado), "\n")
+cat("  - Conglomerados con embeddings:", nrow(embeddings_raw), "\n")
+cat("  - Conglomerados después del JOIN:", nrow(datos_unidos), "\n")
+
+# Identificar pérdida de datos en el JOIN
+conglom_perdidos <- nrow(nfi_agregado) - nrow(datos_unidos)
+if(conglom_perdidos > 0) {
+  cat("  ADVERTENCIA:", conglom_perdidos, "conglomerados del INF sin embeddings\n")
+  cat("  Estos conglomerados se excluyeron del análisis\n")
+} else {
+  cat("  Todos los conglomerados del INF tienen embeddings correspondientes\n")
+}
+
+cat("\n=== DIMENSIONES FINALES ===\n")
+cat("Dataset final:", dim(datos_unidos), "\n")
+cat("  - Cada fila representa 1 conglomerado\n")
+cat("  - Variables: biomasa_Mg_ha + 128 embeddings (z00-z63, v00-v63)\n")
+```
+
+## 3.2 Extracción de Variables
+
+```{r data_prep}
+cat("\n=== PASO 1: EXTRACCIÓN DE VARIABLE RESPUESTA ===\n")
+
+# Extraer biomasa agregada por conglomerado (en Mg/ha) como variable respuesta
+if("biomasa_Mg_ha" %in% names(datos_unidos)) {
+  biomasa <- datos_unidos$biomasa_Mg_ha
+  cat("Usando biomasa_Mg_ha como variable respuesta\n")
+} else {
+  cat("ERROR: No se encontró columna biomasa_Mg_ha\n")
+  cat("Columnas disponibles:", paste(head(names(datos_unidos), 20), collapse = ", "), "...\n")
+  stop("No se encontró columna de biomasa agregada")
+}
+
+cat("  - Rango de biomasa: [", round(min(biomasa, na.rm=TRUE), 3), ",",
+    round(max(biomasa, na.rm=TRUE), 3), "] Mg/ha\n", sep = "")
+cat("  - Promedio:", round(mean(biomasa, na.rm=TRUE), 3), "Mg/ha\n")
+cat("  - Mediana:", round(median(biomasa, na.rm=TRUE), 3), "Mg/ha\n")
+
+cat("\n=== PASO 2: EXTRACCIÓN DE PREDICTORES (EMBEDDINGS) ===\n")
+
+# Identificar columnas de embeddings usando expresión regular
+# z00-z63: medias de las 64 bandas de AlphaEarth
+# v00-v63: varianzas de las 64 bandas de AlphaEarth
+embedding_cols <- grep("^[zv][0-9]+$", names(datos_unidos), value = TRUE)
+
+cat("Columnas de embeddings encontradas:", length(embedding_cols), "\n")
+
+if(length(embedding_cols) == 0) {
+  cat("ERROR: No se encontraron columnas de embeddings\n")
+  cat("Columnas disponibles:", paste(head(names(datos_unidos), 30), collapse = ", "), "...\n")
+  stop("No hay columnas de embeddings para usar como predictores")
+}
+
+cat("Primeras 10 columnas:", paste(head(embedding_cols, 10), collapse = ", "), "\n")
+cat("Últimas 10 columnas:", paste(tail(embedding_cols, 10), collapse = ", "), "\n")
+
+# Extraer matriz de predictores (embeddings)
+X <- datos_unidos[, embedding_cols, drop = FALSE]
+
+# Asegurar que X es data.frame para compatibilidad con funciones posteriores
+if(!is.data.frame(X)) {
+  X <- as.data.frame(X)
+}
+
+cat("\n=== PASO 3: VALIDACIÓN DE TIPOS DE DATOS ===\n")
+
+# Verificar que todas las columnas de embeddings son numéricas
+non_numeric <- names(X)[!sapply(X, is.numeric)]
+
+if(length(non_numeric) > 0) {
+  cat("ADVERTENCIA: Columnas no numéricas detectadas:", paste(non_numeric, collapse = ", "), "\n")
+  cat("Intentando convertir a numérico...\n")
+
+  # Intentar conversión a numérico
+  for(col in non_numeric) {
+    X[[col]] <- as.numeric(as.character(X[[col]]))
+  }
+
+  # Verificar si la conversión funcionó
+  still_non_numeric <- names(X)[!sapply(X, is.numeric)]
+  if(length(still_non_numeric) > 0) {
+    cat("ERROR: No se pudieron convertir a numérico:", paste(still_non_numeric, collapse = ", "), "\n")
+    cat("Eliminando estas columnas...\n")
+    X <- X[, sapply(X, is.numeric), drop = FALSE]
+  }
+}
+
+# Asignar variable respuesta
+y <- biomasa
+
+cat("\n=== PASO 4: VERIFICACIÓN DE DIMENSIONES ===\n")
+cat("Número de conglomerados (observaciones):", length(y), "\n")
+cat("Número de filas en X:", nrow(X), "\n")
+cat("Número de features (embeddings):", ncol(X), "\n")
+cat("Clase de X:", class(X), "\n")
+
+cat("\n=== PASO 5: VERIFICACIÓN DE VARIANZA EN EMBEDDINGS ===\n")
+cat("Importante: Los embeddings deben tener varianza para ser informativos\n\n")
+
+if(ncol(X) > 0 && nrow(X) > 1) {
+  # Inspeccionar primeras 3 columnas como muestra
+  for(i in 1:min(3, ncol(X))) {
+    col_name <- names(X)[i]
+    col_data <- X[[col_name]]
+    cat(sprintf("Columna %s:\n", col_name))
+    cat(sprintf("  - Valores únicos: %d\n", length(unique(col_data))))
+    cat(sprintf("  - Rango: [%.6f, %.6f]\n", min(col_data, na.rm=TRUE), max(col_data, na.rm=TRUE)))
+    cat(sprintf("  - Varianza: %.10f\n", var(col_data, na.rm=TRUE)))
+  }
+
+  # Resumen de varianza para todas las columnas
+  all_unique_counts <- sapply(X, function(col) length(unique(col)))
+  cat("\nResumen de valores únicos en todas las columnas:\n")
+  cat("  - Mínimo:", min(all_unique_counts), "\n")
+  cat("  - Máximo:", max(all_unique_counts), "\n")
+  cat("  - Promedio:", round(mean(all_unique_counts), 2), "\n")
+
+  # Verificar que hay varianza
+  if(max(all_unique_counts) == 1) {
+    cat("\nERROR CRÍTICO: TODAS las columnas tienen un solo valor único\n")
+    cat("Esto significa que NO hay variación en los embeddings\n\n")
+    stop("Sin varianza en embeddings, no se puede entrenar el modelo")
+  }
+}
+
+# Verificar que las dimensiones coincidan
+if(nrow(X) != length(y)) {
+  cat("\nERROR: Dimensiones no coinciden\n")
+  cat("   X:", nrow(X), "| y:", length(y), "\n")
+  stop("Dimensiones incompatibles entre X e y")
+} else {
+  cat("\nDimensiones alineadas correctamente\n")
+}
+```
+
+```{r check_data_quality}
+cat("\n=== VERIFICACIÓN DE CALIDAD DE DATOS ===\n")
+cat("Observaciones:", nrow(X), "\n")
+cat("Predictores (embeddings):", ncol(X), "\n")
+
+# Asegurar que X es data.frame o matrix
+if(!is.data.frame(X) && !is.matrix(X)) {
+  cat("ADVERTENCIA: Convirtiendo X a data.frame\n")
+  X <- as.data.frame(X)
+}
+
+cat("\n--- Verificación de valores faltantes (NA) ---\n")
+cat("  - En biomasa (y):", sum(is.na(y)), "\n")
+cat("  - En embeddings (X):", sum(is.na(X)), "\n")
+
+cat("\n--- Verificación de valores infinitos ---\n")
+cat("  - En biomasa (y):", sum(is.infinite(y)), "\n")
+cat("  - En embeddings (X):", sum(is.infinite(as.matrix(X))), "\n")
+
+# Identificar y eliminar filas con valores problemáticos
+complete_rows <- complete.cases(X) & !is.na(y) & is.finite(y)
+if(sum(!complete_rows) > 0) {
+  cat("\nEliminando", sum(!complete_rows), "filas con valores NA o infinitos\n")
+  X <- X[complete_rows, , drop = FALSE]  # drop = FALSE preserva estructura de data.frame
+  y <- y[complete_rows]
+}
+
+# Garantizar que X es data.frame después del filtrado
+if(!is.data.frame(X)) {
+  X <- as.data.frame(X)
+}
+
+cat("\n--- Dimensiones después de limpieza ---\n")
+cat("Observaciones:", length(y), "\n")
+cat("Filas en X:", nrow(X), "\n")
+cat("Columnas en X:", ncol(X), "\n")
+
+
+```
+
+```{r check_variance}
+cat("\n=== ANÁLISIS DETALLADO DE VARIANZA DE PREDICTORES ===\n")
+cat("Objetivo: Identificar y eliminar columnas con varianza cero o muy baja\n")
+cat("Razón: La regresión requiere varianza para funcionar correctamente\n\n")
+
+# PASO 1: Validar estructura de X
+if(!is.data.frame(X) && !is.matrix(X)) {
+  cat("ERROR: X no es data.frame ni matrix. Tipo:", class(X), "\n")
+  stop("X debe ser data.frame o matrix")
+}
+
+if(nrow(X) == 0) {
+  cat("ERROR: X está vacío (0 filas)\n")
+  stop("No hay datos en X para analizar")
+}
+
+if(ncol(X) == 0) {
+  cat("ERROR: X no tiene columnas\n")
+  stop("No hay columnas de embeddings en X")
+}
+
+# PASO 2: Convertir a matriz numérica
+if(is.data.frame(X)) {
+  # Eliminar cualquier columna no numérica
+  non_numeric <- names(X)[!sapply(X, is.numeric)]
+  if(length(non_numeric) > 0) {
+    cat("ADVERTENCIA: Eliminando columnas no numéricas:", paste(non_numeric, collapse = ", "), "\n")
+    X <- X[, sapply(X, is.numeric), drop = FALSE]
+  }
+  X_matrix <- as.matrix(X)
+} else {
+  X_matrix <- as.matrix(X)
+}
+
+cat("Dimensiones de X para análisis de varianza:", dim(X_matrix), "\n")
+
+# PASO 3: Calcular varianzas de todas las columnas
+# Se usan métodos con manejo de errores para mayor robustez
+cat("\n--- Calculando varianzas ---\n")
+
+variances <- tryCatch({
+  # Método 1: Aplicar función de varianza a cada columna
+  apply(X_matrix, 2, function(col) var(col, na.rm = TRUE))
+}, error = function(e) {
+  cat("ERROR al calcular varianzas con apply():", e$message, "\n")
+  cat("Intentando método alternativo con sapply...\n")
+
+  # Método 2: Usar sapply con índices numéricos
+  tryCatch({
+    sapply(1:ncol(X_matrix), function(i) {
+      var(X_matrix[, i], na.rm = TRUE)
+    })
+  }, error = function(e2) {
+    cat("ERROR con sapply también:", e2$message, "\n")
+    cat("Usando loop manual como último recurso...\n")
+
+    # Método 3: Loop manual
+    result <- numeric(ncol(X_matrix))
+    for(i in 1:ncol(X_matrix)) {
+      result[i] <- var(X_matrix[, i], na.rm = TRUE)
+    }
+    result
+  })
+})
+
+# Asignar nombres de columnas a las varianzas calculadas
+if(is.null(names(variances)) && ncol(X_matrix) == length(variances)) {
+  names(variances) <- colnames(X_matrix)
+}
+
+cat("\n--- Resumen de varianzas ---\n")
+cat("  - Columnas analizadas:", length(variances), "\n")
+cat("  - Varianza mínima:", min(variances, na.rm = TRUE), "\n")
+cat("  - Varianza máxima:", max(variances, na.rm = TRUE), "\n")
+cat("  - Varianza promedio:", mean(variances, na.rm = TRUE), "\n")
+cat("  - Varianza mediana:", median(variances, na.rm = TRUE), "\n")
+
+# Visualizar distribución de varianzas en escala logarítmica
+hist(log10(variances + 1e-20),
+     breaks = 30,
+     main = "Distribución de log10(Varianza) de Embeddings",
+     xlab = "log10(Varianza)",
+     col = "lightblue")
+
+# PASO 4: Identificar y eliminar columnas con varianza muy baja
+# Threshold de 1e-10 para evitar problemas numéricos en regresión
+cat("\n--- Filtrado por varianza ---\n")
+threshold <- 1e-10
+zero_var <- variances < threshold | is.na(variances)
+
+cat("Columnas con varianza <", threshold, ":", sum(zero_var), "\n")
+
+if(sum(zero_var) > 0 && sum(zero_var) < length(variances)) {
+  cat("ADVERTENCIA: Eliminando", sum(zero_var), "columnas con varianza extremadamente baja\n")
+
+  # Obtener nombres de columnas a eliminar
+  if(!is.null(names(variances))) {
+    cols_to_remove <- names(variances)[zero_var]
+  } else if(ncol(X) == length(variances)) {
+    cols_to_remove <- names(X)[zero_var]
+  } else {
+    cols_to_remove <- paste0("Col_", which(zero_var))
+  }
+
+  cat("Columnas eliminadas:", paste(head(cols_to_remove, 20), collapse = ", "),
+      if(sum(zero_var) > 20) "..." else "", "\n")
+
+  # Filtrar X eliminando columnas con baja varianza
+  if(!is.null(names(variances)) && all(names(variances) %in% names(X))) {
+    X <- X[, !zero_var, drop = FALSE]
+  } else {
+    # Método alternativo: filtrar por índice
+    keep_cols <- which(!zero_var)
+    X <- X[, keep_cols, drop = FALSE]
+  }
+} else if(sum(zero_var) == length(variances)) {
+  # Todas las columnas tienen varianza cero - error crítico
+  cat("\n")
+  cat("========================================================================\n")
+  cat("  ERROR CRÍTICO: Todas las columnas tienen varianza muy baja          \n")
+  cat("                                                                        \n")
+  cat("  Posibles causas:                                                     \n")
+  cat("  1. Los embeddings no se cargaron correctamente                       \n")
+  cat("  2. Todos los valores son constantes (sin variación espacial)         \n")
+  cat("  3. Error en la extracción de embeddings desde Google Earth Engine    \n")
+  cat("========================================================================\n")
+  cat("\n")
+
+  # Diagnóstico para depuración
+  cat("DIAGNÓSTICO:\n")
+  cat("  - Filas en X:", nrow(X), "\n")
+  cat("  - Columnas en X:", ncol(X), "\n")
+
+  # Mostrar muestra de datos
+  cat("\nPrimeras 3 filas, primeras 5 columnas de X:\n")
+  print(head(X[1:min(3, nrow(X)), 1:min(5, ncol(X))], 3))
+
+  cat("\nEstadísticas de la primera columna:\n")
+  if(ncol(X) > 0) {
+    cat("  - Mínimo:", min(X[,1], na.rm = TRUE), "\n")
+    cat("  - Máximo:", max(X[,1], na.rm = TRUE), "\n")
+    cat("  - Rango:", diff(range(X[,1], na.rm = TRUE)), "\n")
+  }
+
+  stop("No se puede continuar: todas las columnas tienen varianza cero o muy baja")
+}
+
+cat("\nColumnas restantes después del filtrado:", ncol(X), "\n")
+
+# Mostrar estadísticas de las primeras 5 columnas como verificación
+cat("\n--- Estadísticas de primeras 5 columnas (post-filtrado) ---\n")
+for(i in 1:min(5, ncol(X))) {
+  col_name <- names(X)[i]
+  col_data <- X[, i]
+  cat(sprintf("  %s: min=%.6f, max=%.6f, mean=%.6f, var=%.6f\n",
+              col_name, min(col_data), max(col_data), mean(col_data), var(col_data)))
+}
+```
+
+---
+
+# 4. Análisis Exploratorio de la Biomasa
+
+```{r descriptive_stats}
+# Estadísticas descriptivas
+cat("=== ESTADÍSTICAS DE BIOMASA POR CONGLOMERADO (Mg/ha) ===\n")
+summary(y)
+
+cat("\nDesviación estándar:", round(sd(y), 4), "Mg/ha\n")
+cat("Coeficiente de variación:", round(sd(y)/mean(y) * 100, 2), "%\n")
+
+# Histograma
+hist(y,
+     breaks = 30,
+     col = "steelblue",
+     border = "white",
+     main = "Distribución de Biomasa por Conglomerado",
+     xlab = "Biomasa (Mg/ha)",
+     ylab = "Frecuencia")
+abline(v = mean(y), col = "red", lwd = 2, lty = 2)
+abline(v = median(y), col = "blue", lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Media", "Mediana"),
+       col = c("red", "blue"),
+       lty = 2, lwd = 2)
+```
+
+```{r boxplot_biomasa}
+# Boxplot para detectar outliers
+boxplot(y,
+        col = "lightblue",
+        main = "Boxplot de Biomasa por Conglomerado",
+        ylab = "Biomasa (Mg/ha)",
+        horizontal = TRUE)
+```
+
+
+---
+
+# 5. Regresión Lineal Múltiple
+
+## 5.1 División Train-Test (80-20)
+
+```{r train_test_split}
+# Fijar semilla para reproducibilidad
+set.seed(123)
+
+# División 80-20
+n <- length(y)
+train_size <- floor(0.8 * n)
+
+# Índices aleatorios
+train_index <- sample(1:n, train_size)
+test_index <- setdiff(1:n, train_index)
+
+# Conjuntos de entrenamiento y prueba
+X_train <- X[train_index, ]
+X_test <- X[test_index, ]
+y_train <- y[train_index]
+y_test <- y[test_index]
+
+cat("Total de observaciones:", n, "\n")
+cat("Conjunto de entrenamiento:", length(y_train), "observaciones\n")
+cat("Conjunto de prueba:", length(y_test), "observaciones\n")
+```
+
+## 5.2 Ajuste del Modelo
+
+```{r linear_regression}
+# Crear dataframe para el modelo
+train_data <- data.frame(biomasa = y_train, X_train)
+
+# Ajustar modelo de regresión lineal múltiple
+cat("\n=== AJUSTANDO MODELO DE REGRESIÓN LINEAL ===\n")
+cat("Modelo: biomasa ~ embeddings (", ncol(X), "features)\n\n")
+
+modelo_lm <- lm(biomasa ~ ., data = train_data)
+
+# Resumen del modelo
+summary(modelo_lm)
+```
+
+## 5.3 Diagnóstico del Modelo
+
+```{r diagnostics}
+# Gráficos de diagnóstico
+par(mfrow = c(2, 2))
+plot(modelo_lm)
+par(mfrow = c(1, 1))
+```
+
+---
+
+# 6. Evaluación del Modelo
+
+## 6.1 Predicciones
+
+```{r predictions}
+# Predicciones
+y_train_pred <- predict(modelo_lm, newdata = X_train)
+y_test_pred <- predict(modelo_lm, newdata = X_test)
+
+cat("Predicciones generadas exitosamente\n\n")
+cat("VALORES REALES:\n")
+cat("  Train - Rango:", round(range(y_train), 2), "Mg/ha\n")
+cat("  Test  - Rango:", round(range(y_test), 2), "Mg/ha\n\n")
+cat("PREDICCIONES:\n")
+cat("  Train - Rango:", round(range(y_train_pred), 2), "Mg/ha\n")
+cat("  Test  - Rango:", round(range(y_test_pred), 2), "Mg/ha\n")
+
+# Verificar varianza en predicciones
+cat("\nVarianza de predicciones:\n")
+cat("  Train:", round(var(y_train_pred), 4), "\n")
+cat("  Test:", round(var(y_test_pred), 4), "\n")
+```
+
+## 6.2 Métricas de Desempeño
+
+```{r metrics}
+# Función para calcular métricas (mejorada para evitar NaN)
+calculate_metrics <- function(y_true, y_pred) {
+  mae <- mean(abs(y_true - y_pred))
+  mse <- mean((y_true - y_pred)^2)
+  rmse <- sqrt(mse)
+
+  # Calcular R² de forma segura
+  if(var(y_pred) > 0 && var(y_true) > 0) {
+    r2 <- cor(y_true, y_pred)^2
+  } else {
+    r2 <- NA
+    cat("ADVERTENCIA: No se puede calcular R² (varianza cero)\n")
+  }
+
+  # Porcentaje de error (evitar división por cero)
+  mape <- mean(abs((y_true - y_pred) / (y_true + 1e-10))) * 100
+
+  return(data.frame(
+    MAE = round(mae, 4),
+    RMSE = round(rmse, 4),
+    R2 = round(r2, 4),
+    MAPE = round(mape, 2)
+  ))
+}
+
+# Métricas en entrenamiento
+metrics_train <- calculate_metrics(y_train, y_train_pred)
+cat("\n=== MÉTRICAS EN ENTRENAMIENTO ===\n")
+print(metrics_train)
+
+# Métricas en prueba
+metrics_test <- calculate_metrics(y_test, y_test_pred)
+cat("\n=== MÉTRICAS EN PRUEBA ===\n")
+print(metrics_test)
+
+# Tabla comparativa
+cat("\n=== COMPARACIÓN ===\n")
+metrics_comparison <- rbind(
+  Entrenamiento = metrics_train,
+  Prueba = metrics_test
+)
+print(metrics_comparison)
+
+# Interpretación
+cat("\n=== INTERPRETACIÓN DE RESULTADOS ===\n")
+
+# Interpretar R²
+if(!is.na(metrics_test$R2)) {
+  cat("R² (Coeficiente de Determinación):", round(metrics_test$R2, 4), "\n")
+  cat("  Significado: El modelo explica el", round(metrics_test$R2 * 100, 1), "% de la varianza de la biomasa\n")
+  cat("  Interpretación: ", round(metrics_test$R2 * 100, 1), "% de la variación en biomasa\n")
+  cat("                  se debe a diferencias en el paisaje capturadas por los embeddings\n\n")
+} else {
+  cat("R² (Prueba): No disponible (error en cálculo)\n\n")
+}
+
+# Interpretar RMSE
+cat("RMSE (Error Cuadrático Medio):", round(metrics_test$RMSE, 2), "Mg/ha\n")
+cat("  Significado: En promedio, las predicciones se desvían", round(metrics_test$RMSE, 2), "Mg/ha\n")
+cat("               del valor real de biomasa\n")
+cat("  Contexto: Promedio de biomasa =", round(mean(y), 2), "Mg/ha\n")
+cat("            Error relativo =", round(metrics_test$RMSE / mean(y) * 100, 1), "%\n\n")
+
+# Interpretar MAE
+cat("MAE (Error Absoluto Medio):", round(metrics_test$MAE, 2), "Mg/ha\n")
+cat("  Significado: En promedio, las predicciones difieren", round(metrics_test$MAE, 2), "Mg/ha\n")
+cat("               del valor real (sin penalizar errores grandes)\n")
+```
+
+## 6.3 Visualización de Predicciones
+
+```{r plot_predictions}
+# Configurar gráficos
+par(mfrow = c(1, 2))
+
+# Entrenamiento
+plot(y_train, y_train_pred,
+     pch = 19, col = rgb(0, 0, 1, 0.6),
+     main = paste0("Entrenamiento (R² = ", round(metrics_train$R2, 3), ")"),
+     xlab = "Biomasa Real (Mg/ha)",
+     ylab = "Biomasa Predicha (Mg/ha)",
+     xlim = range(c(y_train, y_train_pred)),
+     ylim = range(c(y_train, y_train_pred)))
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)
+grid()
+
+# Prueba
+plot(y_test, y_test_pred,
+     pch = 19, col = rgb(0, 0.6, 0, 0.7),
+     main = paste0("Prueba (R² = ", round(metrics_test$R2, 3), ")"),
+     xlab = "Biomasa Real (Mg/ha)",
+     ylab = "Biomasa Predicha (Mg/ha)",
+     xlim = range(c(y_test, y_test_pred)),
+     ylim = range(c(y_test, y_test_pred)))
+abline(a = 0, b = 1, col = "red", lwd = 2, lty = 2)
+grid()
+
+par(mfrow = c(1, 1))
+```
+
+## 6.4 Análisis de Residuos
+
+```{r residuals_analysis}
+# Calcular residuos
+residuals_train <- y_train - y_train_pred
+residuals_test <- y_test - y_test_pred
+
+# Configurar gráficos
+par(mfrow = c(2, 2))
+
+# 1. Residuos vs Predicciones (Train)
+plot(y_train_pred, residuals_train,
+     pch = 19, col = rgb(0, 0, 1, 0.5),
+     main = "Residuos vs Predicciones (Train)",
+     xlab = "Biomasa Predicha (Mg/ha)",
+     ylab = "Residuos (Mg/ha)")
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+grid()
+
+# 2. Residuos vs Predicciones (Test)
+plot(y_test_pred, residuals_test,
+     pch = 19, col = rgb(0, 0.6, 0, 0.6),
+     main = "Residuos vs Predicciones (Test)",
+     xlab = "Biomasa Predicha (Mg/ha)",
+     ylab = "Residuos (Mg/ha)")
+abline(h = 0, col = "red", lwd = 2, lty = 2)
+grid()
+
+# 3. Histograma de residuos (Test)
+hist(residuals_test,
+     breaks = 20,
+     col = "lightblue",
+     border = "white",
+     main = "Distribución de Residuos (Test)",
+     xlab = "Residuos (Mg/ha)")
+abline(v = 0, col = "red", lwd = 2, lty = 2)
+
+# 4. Q-Q plot (Test)
+qqnorm(residuals_test, pch = 19, col = rgb(0, 0, 1, 0.5))
+qqline(residuals_test, col = "red", lwd = 2)
+
+par(mfrow = c(1, 1))
+
+# Estadísticas de residuos
+cat("\n=== ESTADÍSTICAS DE RESIDUOS (PRUEBA) ===\n")
+cat("Media:", round(mean(residuals_test), 4), "Mg/ha\n")
+cat("Mediana:", round(median(residuals_test), 4), "Mg/ha\n")
+cat("Desviación estándar:", round(sd(residuals_test), 4), "Mg/ha\n")
+```
+
+## 6.5 Validación Cruzada K-Fold
+
+```{r cross_validation}
+cat("\n")
+cat("========================================================================\n")
+cat("  VALIDACIÓN CRUZADA K-FOLD                                            \n")
+cat("                                                                        \n")
+cat("  Objetivo: Evaluar estabilidad del modelo y detectar sobreajuste      \n")
+cat("                                                                        \n")
+cat("  Método:                                                               \n")
+cat("  - Dividir datos en K particiones (folds)                             \n")
+cat("  - Entrenar K modelos, cada uno dejando fuera 1 fold para validación  \n")
+cat("  - Evaluar desempeño en cada fold de validación                       \n")
+cat("  - Calcular promedio y variabilidad de métricas                       \n")
+cat("                                                                        \n")
+cat("  Interpretación:                                                       \n")
+cat("  - Baja variabilidad entre folds → modelo estable                     \n")
+cat("  - Alta variabilidad entre folds → modelo inestable o sobreajuste     \n")
+cat("  - Métricas similares a train-test → buena generalización             \n")
+cat("========================================================================\n")
+cat("\n")
+
+# Configuración de K-Fold
+set.seed(123)  # Misma semilla para reproducibilidad
+k_folds <- 10  # Número de folds
+
+# Preparar datos completos
+datos_completos <- data.frame(biomasa = y, X)
+n_total <- nrow(datos_completos)
+
+# Crear índices de folds
+fold_indices <- sample(rep(1:k_folds, length.out = n_total))
+
+cat("=== CONFIGURACIÓN ===\n")
+cat("Número de folds (K):", k_folds, "\n")
+cat("Observaciones totales:", n_total, "\n")
+cat("Tamaño aproximado por fold:", floor(n_total / k_folds), "\n\n")
+
+# Almacenar resultados de cada fold
+cv_results <- data.frame(
+  Fold = integer(),
+  R2 = numeric(),
+  RMSE = numeric(),
+  MAE = numeric(),
+  MAPE = numeric(),
+  n_train = integer(),
+  n_val = integer()
+)
+
+cat("=== ENTRENANDO", k_folds, "MODELOS ===\n")
+
+# Iterar sobre cada fold
+for(fold in 1:k_folds) {
+  # Dividir datos en entrenamiento (K-1 folds) y validación (1 fold)
+  val_indices <- which(fold_indices == fold)
+  train_indices <- which(fold_indices != fold)
+
+  # Datos de entrenamiento y validación para este fold
+  datos_train_fold <- datos_completos[train_indices, ]
+  datos_val_fold <- datos_completos[val_indices, ]
+
+  y_train_fold <- datos_train_fold$biomasa
+  y_val_fold <- datos_val_fold$biomasa
+
+  # Entrenar modelo en este fold
+  modelo_fold <- lm(biomasa ~ ., data = datos_train_fold)
+
+  # Predecir en conjunto de validación
+  y_val_pred <- predict(modelo_fold, newdata = datos_val_fold)
+
+  # Calcular métricas para este fold
+  mae_fold <- mean(abs(y_val_fold - y_val_pred))
+  mse_fold <- mean((y_val_fold - y_val_pred)^2)
+  rmse_fold <- sqrt(mse_fold)
+
+  # R² (evitar división por cero)
+  if(var(y_val_pred) > 0 && var(y_val_fold) > 0) {
+    r2_fold <- cor(y_val_fold, y_val_pred)^2
+  } else {
+    r2_fold <- NA
+  }
+
+  # MAPE
+  mape_fold <- mean(abs((y_val_fold - y_val_pred) / (y_val_fold + 1e-10))) * 100
+
+  # Guardar resultados
+  cv_results <- rbind(cv_results, data.frame(
+    Fold = fold,
+    R2 = r2_fold,
+    RMSE = rmse_fold,
+    MAE = mae_fold,
+    MAPE = mape_fold,
+    n_train = length(y_train_fold),
+    n_val = length(y_val_fold)
+  ))
+
+  cat("Fold", fold, "/", k_folds, "- R²:", round(r2_fold, 4),
+      "| RMSE:", round(rmse_fold, 2), "Mg/ha\n")
+}
+
+cat("\n=== RESULTADOS DE VALIDACIÓN CRUZADA ===\n")
+print(cv_results)
+
+# Calcular estadísticas resumidas
+cat("\n--- Estadísticas Resumidas (Promedio ± Desviación Estándar) ---\n")
+cat(sprintf("R²:   %.4f ± %.4f\n", mean(cv_results$R2, na.rm=TRUE), sd(cv_results$R2, na.rm=TRUE)))
+cat(sprintf("RMSE: %.2f ± %.2f Mg/ha\n", mean(cv_results$RMSE), sd(cv_results$RMSE)))
+cat(sprintf("MAE:  %.2f ± %.2f Mg/ha\n", mean(cv_results$MAE), sd(cv_results$MAE)))
+cat(sprintf("MAPE: %.2f ± %.2f %%\n", mean(cv_results$MAPE), sd(cv_results$MAPE)))
+
+# Coeficiente de variación de las métricas
+cv_R2 <- sd(cv_results$R2, na.rm=TRUE) / mean(cv_results$R2, na.rm=TRUE) * 100
+cv_RMSE <- sd(cv_results$RMSE) / mean(cv_results$RMSE) * 100
+
+cat("\n--- Coeficiente de Variación (estabilidad del modelo) ---\n")
+cat(sprintf("CV de R²:   %.1f%%\n", cv_R2))
+cat(sprintf("CV de RMSE: %.1f%%\n", cv_RMSE))
+
+# Comparación con Train-Test
+cat("\n=== COMPARACIÓN: VALIDACIÓN CRUZADA vs TRAIN-TEST ===\n")
+cat("\nValidación Cruzada (promedio de", k_folds, "folds):\n")
+cat("  R²:  ", round(mean(cv_results$R2, na.rm=TRUE), 4), "\n")
+cat("  RMSE:", round(mean(cv_results$RMSE), 2), "Mg/ha\n")
+cat("  MAE: ", round(mean(cv_results$MAE), 2), "Mg/ha\n")
+
+cat("\nTrain-Test (división 80-20):\n")
+cat("  R² (test):  ", round(metrics_test$R2, 4), "\n")
+cat("  RMSE (test):", round(metrics_test$RMSE, 2), "Mg/ha\n")
+cat("  MAE (test): ", round(metrics_test$MAE, 2), "Mg/ha\n")
+
+# Diferencias
+diff_R2 <- abs(mean(cv_results$R2, na.rm=TRUE) - metrics_test$R2)
+diff_RMSE <- abs(mean(cv_results$RMSE) - metrics_test$RMSE)
+
+cat("\nDiferencias absolutas:\n")
+cat("  Δ R²:  ", round(diff_R2, 4), "\n")
+cat("  Δ RMSE:", round(diff_RMSE, 2), "Mg/ha\n")
+
+# Diagnóstico de sobreajuste
+cat("\n=== DIAGNÓSTICO DE SOBREAJUSTE ===\n")
+
+# Criterio 1: Variabilidad entre folds
+if(cv_RMSE < 10) {
+  cat("Variabilidad entre folds: BAJA (CV_RMSE < 10%)\n")
+  cat("  → El modelo es ESTABLE, no depende mucho del conjunto de entrenamiento\n")
+} else if(cv_RMSE < 20) {
+  cat("Variabilidad entre folds: MODERADA (CV_RMSE = ", round(cv_RMSE, 1), "%)\n", sep="")
+  cat("  → Hay cierta variabilidad, pero dentro de lo esperado\n")
+} else {
+  cat("Variabilidad entre folds: ALTA (CV_RMSE = ", round(cv_RMSE, 1), "%)\n", sep="")
+  cat("  → ADVERTENCIA: Modelo puede ser inestable o haber sobreajuste\n")
+}
+
+# Criterio 2: Comparación Train vs CV
+R2_train <- metrics_train$R2
+R2_cv <- mean(cv_results$R2, na.rm=TRUE)
+gap_train_cv <- R2_train - R2_cv
+
+cat("\nComparación Train vs Validación Cruzada:\n")
+cat("  R² train: ", round(R2_train, 4), "\n")
+cat("  R² CV:    ", round(R2_cv, 4), "\n")
+cat("  Gap:      ", round(gap_train_cv, 4), "\n")
+
+if(gap_train_cv > 0.15) {
+  cat("  → SOBREAJUSTE SIGNIFICATIVO detectado (gap > 0.15)\n")
+  cat("     El modelo se ajusta demasiado a los datos de entrenamiento\n")
+  cat("     Considere: regularización (Ridge, Lasso) o reducir número de predictores\n")
+} else if(gap_train_cv > 0.05) {
+  cat("  → Ligero sobreajuste (gap = ", round(gap_train_cv, 4), ")\n", sep="")
+  cat("     Dentro de lo esperado, pero monitorear\n")
+} else {
+  cat("  → NO hay evidencia de sobreajuste significativo\n")
+  cat("     El modelo generaliza bien\n")
+}
+
+# Visualización: Boxplot de métricas por fold
+cat("\n")
+par(mfrow = c(1, 2))
+
+# Boxplot de R²
+boxplot(cv_results$R2,
+        col = "lightblue",
+        main = "Distribución de R² entre Folds",
+        ylab = "R²")
+abline(h = mean(cv_results$R2, na.rm=TRUE), col = "blue", lwd = 2, lty = 2)
+abline(h = metrics_test$R2, col = "red", lwd = 2, lty = 2)
+legend("bottomright",
+       legend = c("Promedio CV", "Test set"),
+       col = c("blue", "red"),
+       lty = 2, lwd = 2, cex = 0.8)
+
+# Boxplot de RMSE
+boxplot(cv_results$RMSE,
+        col = "lightgreen",
+        main = "Distribución de RMSE entre Folds",
+        ylab = "RMSE (Mg/ha)")
+abline(h = mean(cv_results$RMSE), col = "blue", lwd = 2, lty = 2)
+abline(h = metrics_test$RMSE, col = "red", lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Promedio CV", "Test set"),
+       col = c("blue", "red"),
+       lty = 2, lwd = 2, cex = 0.8)
+
+par(mfrow = c(1, 1))
+
+# Gráfico de líneas: métricas por fold
+plot(cv_results$Fold, cv_results$R2,
+     type = "b", pch = 19, col = "steelblue",
+     main = "R² por Fold",
+     xlab = "Fold",
+     ylab = "R²",
+     ylim = c(min(cv_results$R2, na.rm=TRUE) - 0.05,
+              max(cv_results$R2, na.rm=TRUE) + 0.05))
+abline(h = mean(cv_results$R2, na.rm=TRUE), col = "blue", lwd = 2, lty = 2)
+abline(h = metrics_test$R2, col = "red", lwd = 2, lty = 2)
+legend("bottomright",
+       legend = c("Promedio CV", "Test set", "Fold individual"),
+       col = c("blue", "red", "steelblue"),
+       lty = c(2, 2, 1), lwd = c(2, 2, 1), pch = c(NA, NA, 19), cex = 0.8)
+grid()
+
+
+```
+
+---
+
+# 7. Importancia de Variables
+
+```{r variable_importance}
+# Coeficientes del modelo
+coeficientes <- coef(modelo_lm)[-1]  # Excluir intercepto
+coef_abs <- abs(coeficientes)
+n_show <- min(20, length(coef_abs))
+top_features <- sort(coef_abs, decreasing = TRUE)[1:n_show]
+
+cat("=== TOP", n_show, "PREDICTORES MÁS IMPORTANTES ===\n")
+print(round(top_features, 4))
+
+# Gráfico horizontal
+feature_names <- names(top_features)
+if(max(nchar(feature_names)) > 15) {
+  feature_names <- substr(feature_names, 1, 15)
+}
+
+par(mar = c(5, 8, 4, 2))
+tryCatch({
+  barplot(top_features,
+          horiz = TRUE,
+          las = 1,
+          col = "steelblue",
+          main = paste("Top", n_show, "Predictores"),
+          xlab = "|Coeficiente|",
+          cex.names = 0.6,
+          names.arg = feature_names)
+}, error = function(e) {
+  cat("Error en barplot:", e$message, "\n")
+  dotchart(top_features,
+           labels = feature_names,
+           main = paste("Top", n_show, "Predictores"),
+           xlab = "|Coeficiente|",
+           cex = 0.7,
+           col = "steelblue",
+           pch = 19)
+})
+par(mar = c(5, 4, 4, 2))
+```
+
+```{r coef_distribution}
+# Distribución de todos los coeficientes
+hist(coef_abs,
+     breaks = 30,
+     col = "coral",
+     border = "white",
+     main = "Distribución de Coeficientes (Valor Absoluto)",
+     xlab = "|Coeficiente|",
+     ylab = "Frecuencia")
+```
+
+---
+
+# 8. Resumen y Conclusiones
+
+```{r conclusions}
+cat("\n")
+cat(rep("=", 70), "\n", sep = "")
+cat("                  RESUMEN DE RESULTADOS\n")
+cat(rep("=", 70), "\n\n", sep = "")
+
+cat("DATASET:\n")
+cat("  • Observaciones totales:", n, "conglomerados\n")
+cat("  • Entrenamiento:", length(y_train), "| Prueba:", length(y_test), "\n")
+cat("  • Predictores utilizados:", ncol(X), "embeddings\n")
+cat("  • Método: Regresión Lineal Múltiple\n")
+cat("  • Rango de biomasa:", round(min(y), 2), "-", round(max(y), 2), "Mg/ha\n\n")
+
+cat("MODELO: Regresión Lineal\n")
+cat("  Predictores:", ncol(X), "embeddings de paisaje (z + v)\n")
+cat("  Variable respuesta: Biomasa por conglomerado (Mg/ha)\n")
+cat("  Escalamiento: 0.16 ha muestreadas → 1 ha (escala de embeddings)\n\n")
+
+cat("RENDIMIENTO:\n")
+cat("  Entrenamiento:\n")
+cat("    - R²:", round(metrics_train$R2, 4), "\n")
+cat("    - RMSE:", round(metrics_train$RMSE, 2), "Mg/ha\n")
+cat("    - MAE:", round(metrics_train$MAE, 2), "Mg/ha\n\n")
+cat("  Prueba:\n")
+cat("    - R²:", round(metrics_test$R2, 4), "\n")
+cat("    - RMSE:", round(metrics_test$RMSE, 2), "Mg/ha\n")
+cat("    - MAE:", round(metrics_test$MAE, 2), "Mg/ha\n\n")
+
+cat("EVALUACIÓN DEL DESEMPEÑO:\n")
+if(!is.na(metrics_test$R2)) {
+  if(metrics_test$R2 > 0.7) {
+    cat("  EXCELENTE (R² > 0.7)\n")
+    cat("    Los embeddings de paisaje predicen muy bien la biomasa\n")
+    cat("    Las características espectrales capturan fuertemente la estructura forestal\n")
+  } else if(metrics_test$R2 > 0.5) {
+    cat("  BUENO (R² > 0.5)\n")
+    cat("    Los embeddings predicen bien la biomasa\n")
+    cat("    Existe una relación clara entre paisaje y biomasa\n")
+  } else if(metrics_test$R2 > 0.3) {
+    cat("  MODERADO (R² > 0.3)\n")
+    cat("    Los embeddings predicen moderadamente la biomasa\n")
+    cat("    Hay señal pero con variabilidad no explicada\n")
+  } else {
+    cat("  LIMITADO (R² < 0.3)\n")
+    cat("    Los embeddings tienen capacidad predictiva limitada\n")
+    cat("    Posibles causas: escala inadecuada, factores locales dominantes,\n")
+    cat("                     o necesidad de variables adicionales\n")
+  }
+} else {
+  cat("  ERROR: No se pudo calcular R² correctamente\n")
+  cat("         Revisar datos de entrada y proceso de modelado\n")
+}
+
+cat("\n")
+cat(rep("=", 70), "\n", sep = "")
+```
+
+---
+
+# 9. Guardar Resultados
+
+```{r save_results}
+# 1. Guardar predicciones
+resultados <- data.frame(
+  Conjunto = c(rep("Entrenamiento", length(y_train)), rep("Prueba", length(y_test))),
+  Biomasa_Real = c(y_train, y_test),
+  Biomasa_Predicha = c(y_train_pred, y_test_pred),
+  Residuo = c(residuals_train, residuals_test),
+  Error_Absoluto = c(abs(residuals_train), abs(residuals_test)),
+  Error_Porcentual = c(abs(residuals_train/(y_train + 1e-10))*100, abs(residuals_test/(y_test + 1e-10))*100)
+)
+
+write.csv(resultados, "resultados_predicciones.csv", row.names = FALSE)
+cat("\n[OK] Predicciones guardadas en: resultados_predicciones.csv\n")
+
+# 2. Guardar métricas
+write.csv(metrics_comparison, "metricas_modelo.csv", row.names = TRUE)
+cat("[OK] Métricas guardadas en: metricas_modelo.csv\n")
+
+# 3. Guardar coeficientes
+coef_df <- data.frame(
+  Predictor = names(coeficientes),
+  Coeficiente = as.vector(coeficientes),
+  Coef_Absoluto = abs(as.vector(coeficientes))
+)
+coef_df <- coef_df[order(coef_df$Coef_Absoluto, decreasing = TRUE), ]
+
+write.csv(coef_df, "coeficientes_modelo.csv", row.names = FALSE)
+cat("[OK] Coeficientes guardados en: coeficientes_modelo.csv\n")
+
+# 4. Guardar resumen del modelo
+sink("resumen_modelo.txt")
+cat("RESUMEN DEL MODELO DE REGRESIÓN\n")
+cat("================================\n\n")
+summary(modelo_lm)
+cat("\n\nMÉTRICAS DE EVALUACIÓN\n")
+cat("======================\n\n")
+print(metrics_comparison)
+sink()
+cat("[OK] Resumen guardado en: resumen_modelo.txt\n")
+```
+

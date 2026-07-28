@@ -1,0 +1,1010 @@
+---
+title: "Preprocesamiento y Limpieza de Datos GEDI y CCI"
+output: html_document
+---
+
+```{r}
+# Bibliotecas
+library(sf)            
+library(terra)         
+library(dplyr)         
+library(exactextractr) 
+library(ggplot2)       
+library(viridis)       
+library(tidyterra)     
+```
+
+```{r}
+
+# CARGAR LÍMITE ADMINISTRATIVO DE QUINTANA ROO
+
+
+options(repr.plot.width=10, repr.plot.height=10)
+
+# Carga el límite y lo proyecta a EPSG:32616 (UTM zona 16N)
+mexico = st_read("../insumos/QuintanaRoo_Entidad_MOD.gpkg", quiet = TRUE) %>%
+  st_union() %>%
+  st_transform(crs = 32616)
+
+```
+
+
+
+
+
+# SECCIÓN 1: DATOS DE ALTURA GEDI
+
+```{r}
+
+# CARGAR Y PREPARAR RASTER DE ALTURA GEDI
+
+
+# Cargar el raster de altura (producto del script 01)
+hei.rast <- rast("../productos/Forest_height_QROO.tif")
+
+# Convertir límite a formato terra
+mexico_vect <- vect(mexico)
+
+# Verificar sistemas de coordenadas
+crs(hei.rast)
+crs(mexico_vect)
+
+# Reproyectar raster al mismo CRS del límite
+hei.rast <- project(hei.rast, crs(mexico_vect))
+
+# Recortar y enmascarar al área de Quintana Roo
+hei_clip <- mask(
+  crop(hei.rast, mexico_vect),
+  mexico_vect
+)
+
+```
+
+```{r}
+
+# MAPA DE ALTURA GEDI (DATOS EN CRUDO)
+
+
+ggplot() +
+  geom_spatraster(data = hei_clip) +
+  geom_sf(data = mexico, fill = NA, color = "black", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Altura\n(m)",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Altura de Vegetación GLAD (Máscara)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text = element_text(size = 9)
+  )
+
+```
+
+```{r}
+
+# LIMPIEZA DE DATOS - ALTURA GFCH
+
+
+#Pixel values:  0-60 Forest canopy height, meters
+                       # 101 Water
+                        #102 Snow/ice
+                        #103 No data
+
+# Filtrar ceros Y valores especiales (101)
+hei_clean <- ifel(hei_clip <= 0 | hei_clip >= 101, NA, hei_clip)
+summary(hei_clean)
+```
+
+```{r}
+
+# MAPA DE ALTURA GEDI (DATOS LIMPIOS)
+
+
+ggplot() +
+  geom_spatraster(data = hei_clean) +
+  geom_sf(data = mexico, fill = NA, color = "red", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Altura\n(m)",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Altura de Vegetación GLAD (Datos Limpios)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text = element_text(size = 9)
+  )
+
+```
+
+```{r}
+
+# HISTOGRAMAS COMPARATIVOS - ALTURA GEDI
+
+# Datos en crudo (hei_clip) - Convertir NA a 0
+valores_crudo_completo <- values(hei_clip, na.rm = FALSE)
+valores_crudo_con_na <- values(hei_clip, na.rm = FALSE)
+valores_crudo_con_na[is.na(valores_crudo_con_na)] <- 0  # Convertir NA a 0
+df_crudo <- data.frame(
+  Altura = as.numeric(valores_crudo_con_na),
+  Tipo = "Datos en crudo"
+)
+
+# Datos limpios (hei_clean) - Convertir NA a 0 para saber 
+valores_limpio_completo <- values(hei_clean, na.rm = FALSE)
+valores_limpio_con_na <- values(hei_clean, na.rm = FALSE)
+valores_limpio_con_na[is.na(valores_limpio_con_na)] <- 0  # Convertir NA a 0
+df_limpio <- data.frame(
+  Altura = as.numeric(valores_limpio_con_na),
+  Tipo = "Datos limpios"
+)
+
+# Combinar ambos datasets
+df_comparacion <- rbind(df_crudo, df_limpio)
+
+# Gráfica de histogramas
+ggplot(df_comparacion, aes(x = Altura, fill = Tipo)) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white", show.legend = FALSE) +
+  facet_wrap(~Tipo, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Datos en crudo" = "#3498DB", "Datos limpios" = "#27AE60")) +
+  labs(title = "Altura de Vegetación (GEDI): Antes y Después de Limpieza",
+       subtitle = "Quintana Roo, México",
+       x = "Altura (m)",
+       y = "Frecuencia") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+# Datos en crudo - SIN NA
+df_crudo <- data.frame(
+  Altura = as.numeric(values(hei_clip, na.rm = TRUE)),  
+  Tipo = "Datos en crudo"
+)
+
+# Datos limpios - SIN NA
+df_limpio <- data.frame(
+  Altura = as.numeric(values(hei_clean, na.rm = TRUE)),  
+  Tipo = "Datos limpios"
+)
+
+# Combinar
+df_comparacion <- rbind(df_crudo, df_limpio)
+
+# Gráfica
+ggplot(df_comparacion, aes(x = Altura, fill = Tipo)) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white", show.legend = FALSE) +
+  facet_wrap(~Tipo, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c("Datos en crudo" = "#3498DB", "Datos limpios" = "#27AE60")) +
+  scale_y_continuous(
+    trans = "log1p",
+    breaks = c(0, 10, 100, 1000, 10000, 100000, 1000000),
+    labels = scales::comma
+  ) +
+  labs(title = "Altura de Vegetación (GLAD): Antes y Después de Limpieza",
+       subtitle = "Quintana Roo, México",
+       x = "Altura (m)",
+       y = "Frecuencia (escala log)") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+```{r}
+
+# MÉTRICAS DE LIMPIEZA - ALTURA GLAD
+
+# Análisis del raster ANTES del mask
+hei_original_temp <- rast("../productos/Forest_height_QROO.tif")
+hei_original_proj_temp <- project(hei_original_temp, crs(mexico_vect))
+valores_completo_antes_mask_hei <- values(hei_original_proj_temp, na.rm = FALSE)
+
+# Cero/negativos Y 101 fuera del continente
+pixeles_cero_o_negativos_total_hei <- sum(valores_completo_antes_mask_hei <= 0, na.rm = TRUE)
+pixeles_agua_total_hei <- sum(valores_completo_antes_mask_hei == 101, na.rm = TRUE)
+
+# Después del mask (solo continente)
+n_total_hei <- length(valores_crudo_completo)
+n_na_original_hei <- sum(is.na(valores_crudo_completo))
+
+# Píxeles de agua (101) dentro del continente
+pixeles_agua_continente_hei <- sum(valores_crudo_completo == 101, na.rm = TRUE)
+
+# NA + 101 = agua total en crudo
+pixeles_agua_na_original_hei <- n_na_original_hei + pixeles_agua_continente_hei
+
+valores_crudo <- values(hei_clip, na.rm = TRUE)
+n_validos_original_hei <- length(valores_crudo)
+
+# Píxeles <=0 EN EL CONTINENTE
+pixeles_cero_o_negativos_continente_hei <- sum(valores_crudo_completo <= 0, na.rm = TRUE)
+
+# Píxeles <=0 EN EL OCÉANO
+pixeles_cero_o_negativos_oceano_hei <- pixeles_cero_o_negativos_total_hei - pixeles_cero_o_negativos_continente_hei
+
+# Agua total = NA (océano) + 101 (agua continental)
+pixeles_agua_oceano_hei <- n_na_original_hei  # Los NA vienen del mask = océano
+pixeles_agua_total_combinado_hei <- pixeles_agua_oceano_hei + pixeles_agua_continente_hei
+
+# Después de limpieza
+n_na_limpio_hei <- sum(is.na(valores_limpio_completo))
+valores_limpio <- values(hei_clean, na.rm = TRUE)
+n_validos_limpio_hei <- length(valores_limpio)
+
+# Píxeles eliminados por limpieza (<=0 y 101)
+pixeles_eliminados_hei <- n_validos_original_hei - n_validos_limpio_hei
+porcentaje_eliminado_hei <- (pixeles_eliminados_hei / n_validos_original_hei) * 100
+
+# Porcentajes píxeles <=0
+porcentaje_eliminados_oceano_hei <- (pixeles_cero_o_negativos_oceano_hei / pixeles_cero_o_negativos_total_hei) * 100
+porcentaje_eliminados_continente_hei <- (pixeles_cero_o_negativos_continente_hei / pixeles_cero_o_negativos_total_hei) * 100
+
+cat("\n========================================\n")
+cat("MÉTRICAS DE LIMPIEZA - ALTURA GEDI\n")
+cat("========================================\n\n")
+cat("Total de píxeles en el raster:", format(n_total_hei, big.mark = ","), "\n")
+
+cat("\nDATOS EN CRUDO (hei_clip):\n")
+cat("  - Píxeles NA (océano/fuera de máscara):", format(n_na_original_hei, big.mark = ","), "\n")
+cat("  - Píxeles agua interior (101):         ", format(pixeles_agua_continente_hei, big.mark = ","), "\n")
+cat("  - Total píxeles de agua (NA + 101):    ", format(pixeles_agua_total_combinado_hei, big.mark = ","), "\n")  # 
+cat("  - Píxeles con valores:                 ", format(n_validos_original_hei, big.mark = ","), "\n")
+
+cat("\nDATOS LIMPIOS (hei_clean):\n")
+cat("  - Píxeles NA totales:", format(n_na_limpio_hei, big.mark = ","), "\n")
+cat("  - Píxeles válidos (1-100m):", format(n_validos_limpio_hei, big.mark = ","), "\n")
+
+cat("\nRESULTADOS DE LIMPIEZA:\n")
+cat("  - Píxeles eliminados (<=0 y 101):", format(pixeles_eliminados_hei, big.mark = ","), "\n")
+cat("  - Porcentaje eliminado:", round(porcentaje_eliminado_hei, 2), "%\n")
+cat("  - Porcentaje retenido:", round(100 - porcentaje_eliminado_hei, 2), "%\n")
+
+cat("\n========================================\n")
+cat("ANÁLISIS DE AGUA (NA + 101)\n")
+cat("========================================\n\n")
+cat("  - Agua por océano/máscara (NA):        ", format(pixeles_agua_oceano_hei, big.mark = ","), "\n")
+cat("  - Agua interior continente (101):      ", format(pixeles_agua_continente_hei, big.mark = ","), "\n")
+cat("  - TOTAL agua combinada:                ", format(pixeles_agua_total_combinado_hei, big.mark = ","), "\n")  # 
+
+cat("\n========================================\n")
+cat("ANÁLISIS DE PÍXELES <=0 (OCÉANO vs CONTINENTE)\n")
+cat("========================================\n\n")
+cat("Total píxeles <=0 en raster completo:", format(pixeles_cero_o_negativos_total_hei, big.mark = ","), "\n\n")
+cat("UBICACIÓN DE PÍXELES <=0:\n")
+cat("  - En OCÉANO (fuera de máscara):", format(pixeles_cero_o_negativos_oceano_hei, big.mark = ","), "\n")
+cat("    Porcentaje:", round(porcentaje_eliminados_oceano_hei, 2), "%\n\n")
+cat("  - En CONTINENTE (dentro de máscara):", format(pixeles_cero_o_negativos_continente_hei, big.mark = ","), "\n")
+cat("    Porcentaje:", round(porcentaje_eliminados_continente_hei, 2), "%\n")
+
+cat("\n========================================\n")
+cat("ESTADÍSTICAS DE VALORES\n")
+cat("========================================\n")
+cat("\n--- DATOS EN CRUDO (sin NA, sin 101) ---\n")
+print(summary(valores_crudo))
+cat("\n--- DATOS LIMPIOS (1-100m) ---\n")
+print(summary(valores_limpio))
+cat("\n========================================\n")
+```
+
+```{r}
+library(ggrepel)
+library(patchwork)
+
+
+prep_pastel <- function(df) {
+  df <- df[order(df$Pixeles, decreasing = TRUE), ]
+  df$Porcentaje <- round(df$Pixeles / sum(df$Pixeles) * 100, 1)
+  df$fraccion   <- df$Pixeles / sum(df$Pixeles)
+  df$ymax       <- cumsum(df$fraccion)
+  df$ymin       <- c(0, head(df$ymax, n = -1))
+  df$labelpos   <- (df$ymax + df$ymin) / 2
+  df$etiqueta   <- paste0(df$Porcentaje, "%")
+  return(df)
+}
+
+# ============================================
+# DATAFRAMES
+
+df_pastel_hei <- prep_pastel(data.frame(
+  Categoria = c("Océano (NA)", "Agua (101)", "Ceros", "Válidos"),
+  Pixeles   = c(n_na_original_hei, pixeles_agua_continente_hei,
+                pixeles_cero_o_negativos_continente_hei, n_validos_limpio_hei)
+))
+
+df_pastel_agua_hei <- prep_pastel(data.frame(
+  Categoria = c("Océano (NA)", "Agua (101)"),
+  Pixeles   = c(pixeles_agua_oceano_hei, pixeles_agua_continente_hei)
+))
+
+df_pastel_ceros_hei <- prep_pastel(data.frame(
+  Categoria = c("Ceros océano", "Ceros continente"),
+  Pixeles   = c(pixeles_cero_o_negativos_oceano_hei, pixeles_cero_o_negativos_continente_hei)
+))
+
+df_pastel_limpieza_hei <- prep_pastel(data.frame(
+  Categoria = c("Eliminados", "Válidos"),
+  Pixeles   = c(pixeles_eliminados_hei, n_validos_limpio_hei)
+))
+
+# ============================================
+# PASTEL 1: Distribución total
+
+p_pastel1_hei <- ggplot(df_pastel_hei,
+                        aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Océano (NA)" = "#3498DB",
+    "Agua (101)"  = "#2471A3",
+    "Ceros"       = "#E67E22",
+    "Válidos"     = "#27AE60"
+  )) +
+  xlim(c(0, 5)) +
+  labs(title = "Distribución Total de Píxeles", fill = "Categoría") +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+# ============================================
+# PASTEL 2: NAN VS 101
+
+p_pastel2_hei <- ggplot(df_pastel_agua_hei,
+                        aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Máscara (NA)" = "#3498DB",
+    "Agua (101)"  = "#2471A3"
+  )) +
+  xlim(c(0, 5)) +
+  labs(title = "NA vs 101", fill = "Categoría") +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.position = "none"
+  )
+
+# ============================================
+# PASTEL 3: Ubicación de ceros
+
+p_pastel3_hei <- ggplot(df_pastel_ceros_hei,
+                        aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Ceros máscara"     = "#3498DB",
+    "Ceros continente" = "#E67E22"
+  )) +
+  xlim(c(0, 5)) +
+  labs(title = " Píxeles ≤ 0", fill = "Categoria") +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+# ============================================
+# PASTEL 4: Resultado de limpieza
+
+p_pastel4_hei <- ggplot(df_pastel_limpieza_hei,
+                        aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Eliminados" = "#E74C3C",
+    "Válidos"    = "#27AE60"
+  )) +
+  xlim(c(0, 5)) +
+  labs(title = "Resultado de Limpieza", fill = "Categoría") +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 12),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+# ============================================
+# PLOT 1
+
+(p_pastel1_hei | p_pastel2_hei) +
+  plot_annotation(
+    title    = "Análisis de Píxeles — Altura GFCH",
+    subtitle = "Quintana Roo, México",
+    theme    = theme(
+      plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray40")
+    )
+  )
+
+# ============================================
+# PLOT 2
+
+(p_pastel3_hei | p_pastel4_hei) +
+  plot_annotation(
+    title    = "Análisis de Limpieza — Altura GFCH",
+    subtitle = "Quintana Roo, México",
+    theme    = theme(
+      plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray40")
+    )
+  )
+```
+
+
+
+
+
+# SECCIÓN 2: DATOS DE BIOMASA CCI
+
+
+
+```{r}
+
+cci.rast <- rast("../insumos/CCI_CORTE_QR.tif")
+
+# Convertir límite a formato terra y reproyectar
+mexico_vect <- vect(mexico)
+
+# Verificar sistemas de coordenadas
+crs(cci.rast)
+crs(mexico_vect)
+
+# Reproyectar raster al mismo CRS del límite
+cci.rast <- project(cci.rast, crs(mexico_vect))
+
+# Recortar y enmascarar 
+cci_clip <- mask(
+  crop(cci.rast, mexico_vect),
+  mexico_vect
+)
+
+```
+
+```{r}
+
+# MAPA DE BIOMASA CCI (DATOS EN CRUDO)
+
+
+ggplot() +
+  geom_spatraster(data = cci_clip) +
+  geom_sf(data = mexico, fill = NA, color = "black", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Biomasa Aérea\n(Mg/ha)",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Biomasa Aérea CCI (Máscara)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text = element_text(size = 9)
+  )
+
+```
+
+```{r}
+summary(cci_clip)
+```
+
+
+```{r}
+
+# HISTOGRAMAS - DATOS CRUDOS (CCI)
+# ============================================
+library(patchwork)
+
+# Cargar raster original ANTES del recorte/máscara
+cci_original      <- rast("../insumos/CCI_CORTE_QR.tif")
+cci_original_proj <- project(cci_original, crs(mexico_vect))
+
+# Extraer valores
+valores_completo   <- values(cci_original_proj, na.rm = TRUE)
+valores_continente <- values(cci_clip, na.rm = TRUE)
+valores_oceano     <- valores_completo[!valores_completo %in% valores_continente]
+
+# Crear dataframe
+df_comparacion <- data.frame(
+  AGBD = c(
+    valores_completo[1:min(length(valores_completo), 1000000)],
+    valores_oceano[1:min(length(valores_oceano), 1000000)],
+    valores_continente
+  ),
+  Panel = c(
+    rep("1. Completo (crudo)",   min(length(valores_completo), 1000000)),
+    rep("2. Océano (crudo)",     min(length(valores_oceano), 1000000)),
+    rep("3. Continente (crudo)", length(valores_continente))
+  )
+)
+
+# Forzar orden de paneles
+df_comparacion$Panel <- factor(
+  df_comparacion$Panel,
+  levels = c(
+    "1. Completo (crudo)",
+    "2. Océano (crudo)",
+    "3. Continente (crudo)"
+  )
+)
+
+limite_y <- 250000
+
+
+# PANEL 1: Completo (crudo) — columna izquierda
+# ============================================
+p_completo <- ggplot(
+  df_comparacion %>% filter(Panel == "1. Completo (crudo)"),
+  aes(x = AGBD, fill = Panel)
+) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white", show.legend = FALSE) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.2)),
+    labels = scales::comma
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  coord_cartesian(ylim = c(0, limite_y)) +
+  scale_fill_manual(values = c("1. Completo (crudo)" = "#5D6D7E")) +
+  labs(
+    title   = "Completo",
+    caption = "* Eje Y limitado  para mejor visualización",
+    x       = "Biomasa Aérea (Mg/ha)",
+    y       = "Frecuencia"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.caption     = element_text(color = "gray50", size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+
+# PANEL 2: Océano (crudo) — columna derecha arriba
+# ============================================
+p_oceano <- ggplot(
+  df_comparacion %>% filter(Panel == "2. Océano (crudo)"),
+  aes(x = AGBD, fill = Panel)
+) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white", show.legend = FALSE) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.2)),
+    labels = scales::comma
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  scale_fill_manual(values = c("2. Océano (crudo)" = "#3498DB")) +
+  labs(title = "Océano", x = "Biomasa Aérea (Mg/ha)", y = "Frecuencia") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+# PANEL 3: Continente (crudo) — columna derecha abajo
+# ============================================
+p_continente <- ggplot(
+  df_comparacion %>% filter(Panel == "3. Continente (crudo)"),
+  aes(x = AGBD, fill = Panel)
+) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white", show.legend = FALSE) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.2)),
+    labels = scales::comma
+  ) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  scale_fill_manual(values = c("3. Continente (crudo)" = "#E67E22")) +
+  labs(title = "Continente", x = "Biomasa Aérea (Mg/ha)", y = "Frecuencia") +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+
+# COMBINAR CON PATCHWORK
+# ============================================
+(p_completo | (p_oceano / p_continente)) +
+  plot_annotation(
+    title    = "Biomasa Aérea (CCI): Máscara",
+    subtitle = "Quintana Roo, México",
+    theme    = theme(
+      plot.title    = element_text(hjust = 0.5, face = "bold", size = 13),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray40")
+    )
+  )
+```
+
+
+
+
+
+```{r}
+# ============================================
+# MÉTRICAS - OCÉANO vs CONTINENTE (CCI)
+# ============================================
+
+# Extraer valores antes y después de la máscara
+valores_antes_mask <- values(cci_original_proj, na.rm = TRUE)
+valores_despues_mask <- values(cci_clip, na.rm = TRUE)
+
+# Calcular píxeles oceánicos (eliminados por la máscara)
+n_oceano <- length(valores_antes_mask) - length(valores_despues_mask)
+cat("\n========================================\n")
+cat("SEPARACIÓN OCÉANO vs CONTINENTE - CCI\n")
+cat("========================================\n\n")
+cat("ANTES DE MÁSCARA (raster completo):\n")
+cat("  - Total píxeles:", format(length(valores_antes_mask), big.mark = ","), "\n")
+cat("\nDESPUÉS DE MÁSCARA (solo Quintana Roo):\n")
+cat("  - Total píxeles:", format(length(valores_despues_mask), big.mark = ","), "\n")
+cat("\nPÍXELES OCEÁNICOS REMOVIDOS:\n")
+cat("  - Cantidad:", format(n_oceano, big.mark = ","), "\n")
+cat("  - Porcentaje del total:", round((n_oceano/length(valores_antes_mask))*100, 2), "%\n")
+cat("========================================\n\n")
+```
+
+```{r}
+
+# LIMPIEZA DE DATOS - BIOMASA CCI
+
+
+# Eliminar píxeles con valores <= 0 (píxeles negros sin información válida)
+
+cci_clean <- ifel(cci_clip <= 0, NA, cci_clip)
+
+summary(cci_clean)
+```
+
+```{r}
+
+# MAPA DE BIOMASA CCI (DATOS LIMPIOS)
+
+
+ggplot() +
+  geom_spatraster(data = cci_clean) +
+  geom_sf(data = mexico, fill = NA, color = "black", linewidth = 0.6) +
+  scale_fill_viridis_c(
+    name = "Biomasa Aérea\n(Mg/ha)",
+    option = "viridis",
+    na.value = "transparent"
+  ) +
+  labs(
+    title = "Biomasa Aérea CCI (Datos Limpios)",
+    subtitle = "Quintana Roo, México",
+    x = "Longitud",
+    y = "Latitud"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "right",
+    panel.grid = element_line(color = "gray90"),
+    axis.text = element_text(size = 9)
+  )
+
+```
+
+```{r}
+
+# HISTOGRAMA - DATOS LIMPIOS (CCI)
+
+
+# Extraer valores limpios
+valores_limpios <- values(cci_clean, na.rm = TRUE)
+
+# Crear dataframe
+df_limpios <- data.frame(
+  AGBD = as.numeric(valores_limpios)
+)
+
+# Gráfica
+ggplot(df_limpios, aes(x = AGBD)) +
+  geom_histogram(bins = 50, alpha = 0.8, color = "white",
+                 fill = "#27AE60", show.legend = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2)), labels = scales::comma) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.2))) +
+  labs(
+    title    = "Biomasa Aérea (CCI): Datos Limpios",
+    subtitle = "Quintana Roo, México",
+    x        = "Biomasa Aérea (Mg/ha)",
+    y        = "Frecuencia"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, color = "gray40"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+```{r}
+
+# MÉTRICAS DE LIMPIEZA DETALLADA - BIOMASA CCI
+# Incluye análisis de píxeles <=0 en océano vs continente
+# ============================================
+
+# Análisis del raster ANTES del mask (para identificar píxeles <=0 en océano)
+valores_completo_antes_mask <- values(cci_original_proj, na.rm = FALSE)
+pixeles_cero_o_negativos_total <- sum(valores_completo_antes_mask <= 0, na.rm = TRUE)
+
+# Extraer valores completos (incluyendo NA) de los rasters
+valores_crudo_completo_cci <- values(cci_clip, na.rm = FALSE)
+valores_limpio_completo_cci <- values(cci_clean, na.rm = FALSE)
+
+# Después del mask (solo continente)
+n_total_cci <- length(valores_crudo_completo_cci)
+n_na_original_cci <- sum(is.na(valores_crudo_completo_cci))
+valores_crudo_cci <- values(cci_clip, na.rm = TRUE)  # Valores sin NA para estadísticas
+n_validos_original_cci <- length(valores_crudo_cci)
+
+# Píxeles <=0 EN EL CONTINENTE (dentro de la máscara)
+pixeles_cero_o_negativos_continente <- sum(valores_crudo_completo_cci <= 0, na.rm = TRUE)
+
+# Píxeles <=0 EN EL OCÉANO (fuera de la máscara)
+pixeles_cero_o_negativos_oceano <- pixeles_cero_o_negativos_total - pixeles_cero_o_negativos_continente
+
+# Después de limpieza
+n_na_limpio_cci <- sum(is.na(valores_limpio_completo_cci))
+valores_limpio_cci <- values(cci_clean, na.rm = TRUE)  # Valores sin NA para estadísticas
+n_validos_limpio_cci <- length(valores_limpio_cci)
+
+# Píxeles eliminados por limpieza
+pixeles_eliminados_cci <- n_validos_original_cci - n_validos_limpio_cci
+porcentaje_eliminado_cci <- (pixeles_eliminados_cci / n_validos_original_cci) * 100
+
+# Porcentajes de dónde estaban los píxeles <=0
+porcentaje_eliminados_oceano <- (pixeles_cero_o_negativos_oceano / pixeles_cero_o_negativos_total) * 100
+porcentaje_eliminados_continente <- (pixeles_cero_o_negativos_continente / pixeles_cero_o_negativos_total) * 100
+
+cat("\n========================================\n")
+cat("MÉTRICAS DE LIMPIEZA - BIOMASA CCI\n")
+cat("========================================\n\n")
+cat("Total de píxeles en el raster:", format(n_total_cci, big.mark = ","), "\n")
+cat("\nDATOS EN CRUDO (cci_clip):\n")
+cat("  - Píxeles NA (océano/fuera):", format(n_na_original_cci, big.mark = ","), "\n")
+cat("  - Píxeles con valores:", format(n_validos_original_cci, big.mark = ","), "\n")
+cat("\nDATOS LIMPIOS (cci_clean):\n")
+cat("  - Píxeles NA totales:", format(n_na_limpio_cci, big.mark = ","), "\n")
+cat("  - Píxeles válidos (>0):", format(n_validos_limpio_cci, big.mark = ","), "\n")
+cat("\nRESULTADOS DE LIMPIEZA:\n")
+cat("  - Píxeles eliminados (<=0):", format(pixeles_eliminados_cci, big.mark = ","), "\n")
+cat("  - Porcentaje eliminado:", round(porcentaje_eliminado_cci, 2), "%\n")
+cat("  - Porcentaje retenido:", round(100 - porcentaje_eliminado_cci, 2), "%\n")
+cat("\n========================================\n")
+cat("ANÁLISIS DE PÍXELES <=0 (OCÉANO vs CONTINENTE)\n")
+cat("========================================\n\n")
+cat("Total de píxeles <=0 en raster completo:", format(pixeles_cero_o_negativos_total, big.mark = ","), "\n\n")
+cat("UBICACIÓN DE PÍXELES <=0:\n")
+cat("  - En OCÉANO (fuera de máscara):", format(pixeles_cero_o_negativos_oceano, big.mark = ","), "\n")
+cat("    Porcentaje:", round(porcentaje_eliminados_oceano, 2), "%\n\n")
+cat("  - En CONTINENTE (dentro de máscara):", format(pixeles_cero_o_negativos_continente, big.mark = ","), "\n")
+cat("    Porcentaje:", round(porcentaje_eliminados_continente, 2), "%\n")
+cat("\nNOTA: Los", format(pixeles_eliminados_cci, big.mark = ","), "píxeles eliminados\n")
+cat("      corresponden a los que estaban EN EL CONTINENTE.\n")
+cat("\n========================================\n")
+cat("ESTADÍSTICAS DE VALORES\n")
+cat("========================================\n")
+cat("\n--- DATOS EN CRUDO ---\n")
+print(summary(valores_crudo_cci))
+cat("\n--- DATOS LIMPIOS ---\n")
+print(summary(valores_limpio_cci))
+cat("\n========================================\n")
+```
+
+
+
+```{r}
+
+
+df_pastel <- data.frame(
+  Categoria = c("Océano/fuera (NA)", "Ceros continente", "Válidos (>0)"),
+  Pixeles   = c(n_na_original_cci, pixeles_cero_o_negativos_continente, n_validos_limpio_cci)
+)
+
+df_pastel <- df_pastel[order(df_pastel$Pixeles, decreasing = TRUE), ]
+df_pastel$Porcentaje <- round(df_pastel$Pixeles / sum(df_pastel$Pixeles) * 100, 1)
+df_pastel$fraccion   <- df_pastel$Pixeles / sum(df_pastel$Pixeles)
+df_pastel$ymax       <- cumsum(df_pastel$fraccion)
+df_pastel$ymin       <- c(0, head(df_pastel$ymax, n = -1))
+df_pastel$labelpos   <- (df_pastel$ymax + df_pastel$ymin) / 2
+df_pastel$etiqueta   <- paste0(df_pastel$Porcentaje, "%")
+
+ggplot(df_pastel,
+       aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Océano/fuera (NA)" = "#3498DB",
+    "Ceros continente"  = "#E67E22",
+    "Válidos (>0)"      = "#27AE60"
+  )) +
+  xlim(c(0, 5)) +
+  labs(
+    title    = "Distribución de Píxeles — Biomasa CCI",
+    subtitle = "Quintana Roo, México",
+    fill     = "Categoría"
+  ) +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle   = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+```
+```{r}
+df_pastel_limpieza <- data.frame(
+  Categoria = c("Eliminados (≤0)", "Válidos (>0)"),
+  Pixeles   = c(pixeles_eliminados_cci, n_validos_limpio_cci)
+)
+
+df_pastel_limpieza <- df_pastel_limpieza[order(df_pastel_limpieza$Pixeles, decreasing = TRUE), ]
+df_pastel_limpieza$Porcentaje <- round(df_pastel_limpieza$Pixeles / sum(df_pastel_limpieza$Pixeles) * 100, 1)
+df_pastel_limpieza$fraccion   <- df_pastel_limpieza$Pixeles / sum(df_pastel_limpieza$Pixeles)
+df_pastel_limpieza$ymax       <- cumsum(df_pastel_limpieza$fraccion)
+df_pastel_limpieza$ymin       <- c(0, head(df_pastel_limpieza$ymax, n = -1))
+df_pastel_limpieza$labelpos   <- (df_pastel_limpieza$ymax + df_pastel_limpieza$ymin) / 2
+df_pastel_limpieza$etiqueta   <- paste0(df_pastel_limpieza$Porcentaje, "%")
+
+ggplot(df_pastel_limpieza,
+       aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 0, fill = Categoria)) +
+  geom_rect() +
+  geom_label_repel(
+    aes(x = 4.5, y = labelpos, label = etiqueta, fill = Categoria),
+    color         = "white",
+    fontface      = "bold",
+    size          = 3.5,
+    show.legend   = FALSE,
+    nudge_x       = 0.3,
+    direction     = "y",
+    segment.size  = 0.3,
+    segment.color = "gray50"
+  ) +
+  coord_polar(theta = "y") +
+  scale_fill_manual(values = c(
+    "Eliminados (≤0)" = "#E74C3C",
+    "Válidos (>0)"    = "#27AE60"
+  )) +
+  xlim(c(0, 5)) +
+  labs(
+    title    = "Resultado de Limpieza — Biomasa CCI",
+    subtitle = "Quintana Roo, México",
+    fill     = "Categoría"
+  ) +
+  theme_void() +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 13),
+    plot.subtitle   = element_text(hjust = 0.5, color = "gray40"),
+    legend.position = "bottom",
+    legend.text     = element_text(size = 8),
+    legend.title    = element_text(size = 8, face = "bold"),
+    legend.key.size = unit(0.4, "cm")
+  )
+```
+
+
+# SECCIÓN 3: EXPORTAR RASTERS LIMPIOS
+
+
+```{r}
+
+
+# Guardar raster de biomasa CCI limpio
+writeRaster(
+  cci_clean, 
+  "../productos/biomasa.tif",
+  filetype = "GTiff",
+  overwrite = TRUE
+)
+
+# Guardar raster de altura GEDI limpio
+writeRaster(
+  hei_clean,
+  "../productos/hei.tif",
+  filetype = "GTiff",
+  overwrite = TRUE
+)
+```
